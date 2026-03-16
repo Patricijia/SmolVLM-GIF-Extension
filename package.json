@@ -17,6 +17,7 @@
   "dependencies": {
     "@huggingface/transformers": "^3.4.0",
     "gifuct-js": "^2.1.2",
+    "tes": "^1.0.0",
     "tesseract.js": "^7.0.0"
   }
 }

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 mkdirSync('dist/wasm', { recursive: true });
+mkdirSync('dist/tesseract', { recursive: true });
 
 // Copy WASM files
 const srcDir = join(__dirname, 'node_modules/@huggingface/transformers/dist');
@@ -18,6 +19,26 @@ if (existsSync(srcDir)) {
       console.log('Copied:', file);
     }
   }
+}
+
+// Copy Tesseract.js core WASM files
+const tessSrcDir = join(__dirname, 'node_modules/tesseract.js-core');
+const tessDestDir = join(__dirname, 'dist/tesseract');
+
+if (existsSync(tessSrcDir)) {
+  for (const file of readdirSync(tessSrcDir)) {
+    if (file.startsWith('tesseract-core') && (file.endsWith('.wasm') || file.endsWith('.wasm.js'))) {
+      copyFileSync(join(tessSrcDir, file), join(tessDestDir, file));
+      console.log('Copied tesseract:', file);
+    }
+  }
+}
+
+// Copy Tesseract.js worker
+const tessWorkerPath = join(__dirname, 'node_modules/tesseract.js/dist/worker.min.js');
+if (existsSync(tessWorkerPath)) {
+  copyFileSync(tessWorkerPath, join(tessDestDir, 'worker.min.js'));
+  console.log('Copied tesseract: worker.min.js');
 }
 
 // Bundle offscreen.js

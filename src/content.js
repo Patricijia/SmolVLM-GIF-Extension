@@ -13,6 +13,7 @@ let totalCaptioned = 0;
 let initialScanDone = false;
 let modelReadyTime = null;
 let modelDevice = 'unknown';
+let gifsFoundTime = null;
 
 // Settings
 const MAX_GIFS = 10;
@@ -61,19 +62,19 @@ function isInViewport(img) {
 
 function printSummary() {
   if (allCaptionsTime) return;
-  
+
   allCaptionsTime = performance.now() - PAGE_LOAD_TIME;
-  const timeFromModelReady = modelReadyTime ? (allCaptionsTime - modelReadyTime) : allCaptionsTime;
-  
+  const captioningTime = gifsFoundTime ? (allCaptionsTime - gifsFoundTime) : allCaptionsTime;
+
   console.log('[GIF] ═══════════════════════════════════════');
   console.log('[GIF] 🎉 ACCESSIBILITY READY');
-  console.log('[GIF]   Device: ' + modelDevice);
-  console.log('[GIF]   Total time: ' + (allCaptionsTime / 1000).toFixed(1) + 's');
+  console.log('[GIF]   Page load → ready: ' + (allCaptionsTime / 1000).toFixed(1) + 's');
   console.log('[GIF]   Model load: ' + ((modelReadyTime || 0) / 1000).toFixed(1) + 's');
-  console.log('[GIF]   Captions: ' + (timeFromModelReady / 1000).toFixed(1) + 's');
-  console.log('[GIF]   GIFs: ' + totalCaptioned);
+  console.log('[GIF]   First caption: ' + ((firstCaptionTime || 0) / 1000).toFixed(1) + 's');
+  console.log('[GIF]   Captioning: ' + (captioningTime / 1000).toFixed(1) + 's');
+  console.log('[GIF]   GIFs: ' + totalCaptioned + ' (' + modelDevice + ')');
   if (totalCaptioned > 0) {
-    console.log('[GIF]   Avg: ' + Math.round(timeFromModelReady / totalCaptioned) + 'ms/GIF');
+    console.log('[GIF]   Avg: ' + Math.round(captioningTime / totalCaptioned) + 'ms/GIF');
   }
   console.log('[GIF] ═══════════════════════════════════════');
 }
@@ -83,11 +84,14 @@ function applyCaption(img, caption, time) {
   img.setAttribute('aria-label', caption);
   img.setAttribute('role', 'img');
   img.setAttribute('tabindex', '0');
-  
+
   totalCaptioned++;
-  
+  if (!firstCaptionTime) {
+    firstCaptionTime = performance.now() - PAGE_LOAD_TIME;
+  }
+
   logTiming('✓ [' + totalCaptioned + '/' + totalGifsFound + '] "' + caption + '" (' + time + 'ms)');
-  
+
   if (totalCaptioned >= totalGifsFound && totalGifsFound > 0) {
     printSummary();
   }
@@ -184,12 +188,50 @@ function createGrid(frames) {
   return canvas.toDataURL('image/jpeg', 0.85);
 }
 
+function renderSingleFrame(frames) {
+  // Composite frames up to the middle to get a full image
+  // (individual frames can be tiny delta patches)
+  const midIndex = Math.floor(frames.length / 2);
+  const firstFrame = frames[0];
+
+  // Use the first frame to determine full GIF dimensions
+  const gifWidth = firstFrame.dims.width;
+  const gifHeight = firstFrame.dims.height;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = gifWidth;
+  canvas.height = gifHeight;
+  const ctx = canvas.getContext('2d');
+
+  // Composite from frame 0 to mid frame
+  const tempCanvas = document.createElement('canvas');
+  tempCanvas.width = gifWidth;
+  tempCanvas.height = gifHeight;
+  const tempCtx = tempCanvas.getContext('2d');
+
+  for (let i = 0; i <= midIndex; i++) {
+    const f = frames[i];
+    const imageData = new ImageData(
+      new Uint8ClampedArray(f.patch),
+      f.dims.width,
+      f.dims.height
+    );
+    tempCtx.putImageData(imageData, f.dims.left || 0, f.dims.top || 0);
+  }
+
+  ctx.drawImage(tempCanvas, 0, 0);
+  return canvas.toDataURL('image/png');
+}
+
 async function getImageData(img) {
   try {
     const frames = await extractGifFrames(img.src);
-    return createGrid(frames);
+    const grid = createGrid(frames);
+    const ocrFrame = renderSingleFrame(frames);
+    return { grid, ocrFrame };
   } catch (e) {
-    return await getFallbackImageData(img);
+    const fallback = await getFallbackImageData(img);
+    return { grid: fallback, ocrFrame: fallback };
   }
 }
 
@@ -223,26 +265,36 @@ async function getFallbackImageData(img) {
 }
 
 async function queueGif(img, priority) {
-  if (!isContextValid()) return;
-  if (processed.has(img.src)) return;
+  if (!isContextValid()) {
+    logTiming('queueGif: context invalid, skipping');
+    return;
+  }
+  if (processed.has(img.src)) {
+    logTiming('queueGif: already processed, skipping');
+    return;
+  }
   processed.add(img.src);
-  
+
   const id = 'g' + Date.now() + Math.random().toString(36).slice(2, 6);
   pending.set(id, img);
-  
+
   try {
-    const data = await getImageData(img);
+    logTiming('queueGif: extracting frames for ' + id);
+    const { grid, ocrFrame } = await getImageData(img);
+    logTiming('queueGif: frames extracted, grid size=' + grid.length + ' ocrFrame size=' + ocrFrame.length);
     const storageData = await chrome.storage.local.get('captionQueue');
     const queue = storageData.captionQueue || [];
-    
+
     if (priority) {
-      queue.unshift({ gifId: id, imageData: data });
+      queue.unshift({ gifId: id, imageData: grid, ocrImage: ocrFrame });
     } else {
-      queue.push({ gifId: id, imageData: data });
+      queue.push({ gifId: id, imageData: grid, ocrImage: ocrFrame });
     }
-    
+
     await chrome.storage.local.set({ captionQueue: queue });
+    logTiming('queueGif: ' + id + ' added to queue (length=' + queue.length + ')');
   } catch (e) {
+    logTiming('queueGif ERROR: ' + e.message);
     processed.delete(img.src);
     pending.delete(id);
   }
@@ -269,65 +321,103 @@ async function checkResults() {
   } catch (e) {}
 }
 
+let isScanning = false;
+
 async function scan() {
-  if (initialScanDone) return;
-  
-  const status = await getModelStatus();
-  if (!status || status.status !== 'ready') return;
-  
-  if (!modelReadyTime) {
-    modelReadyTime = performance.now() - PAGE_LOAD_TIME;
-    modelDevice = status.device || 'unknown';
-    logTiming('Model ready! (' + modelDevice + ')');
-  }
-  
-  const visibleGifs = [];
-  const hiddenGifs = [];
-  
-  document.querySelectorAll('img').forEach(img => {
-    const src = img.src.toLowerCase();
-    if ((src.includes('media') && (src.includes('giphy') || src.includes('tenor'))) &&
-        !src.includes('logo') &&
-        !processed.has(img.src) &&
-        img.naturalWidth > 100) {
-      
-      if (isInViewport(img)) {
-        visibleGifs.push(img);
-      } else {
-        hiddenGifs.push(img);
-      }
+  if (initialScanDone || isScanning) return;
+  isScanning = true;
+
+  try {
+    const status = await getModelStatus();
+    if (!status || status.status !== 'ready') return;
+
+    if (!modelReadyTime) {
+      modelReadyTime = performance.now() - PAGE_LOAD_TIME;
+      modelDevice = status.device || 'unknown';
+      logTiming('Model ready! (' + modelDevice + ')');
     }
-  });
-  
-  const allGifs = [...visibleGifs, ...hiddenGifs].slice(0, MAX_GIFS);
-  const visibleCount = Math.min(visibleGifs.length, MAX_GIFS);
-  
-  totalGifsFound = allGifs.length;
-  
-  if (totalGifsFound > 0) {
+
+    const allImages = document.querySelectorAll('img');
+    const visibleGifs = [];
+    const hiddenGifs = [];
+
+    allImages.forEach(img => {
+      const src = img.src.toLowerCase();
+      const isGif = src.includes('.gif') || img.src.includes('.gif');
+      if (isGif && !processed.has(img.src) && img.naturalWidth > 100) {
+        if (isInViewport(img)) {
+          visibleGifs.push(img);
+        } else {
+          hiddenGifs.push(img);
+        }
+      }
+    });
+
+    const allGifs = [...visibleGifs, ...hiddenGifs].slice(0, MAX_GIFS);
+    const visibleCount = Math.min(visibleGifs.length, MAX_GIFS);
+
+    if (allGifs.length === 0) return;
+
+    totalGifsFound = allGifs.length;
+    initialScanDone = true;
+    gifsFoundTime = performance.now() - PAGE_LOAD_TIME;
+
     logTiming('Found ' + totalGifsFound + ' GIFs (' + visibleCount + ' visible)');
-    
+
     for (let i = 0; i < allGifs.length; i++) {
       await queueGif(allGifs[i], i < visibleCount);
     }
-    
     logTiming('All ' + totalGifsFound + ' GIFs queued');
+  } finally {
+    isScanning = false;
   }
-  
-  initialScanDone = true;
 }
 
 if (isContextValid()) {
   logTiming('Initializing...');
-  
+
   setInterval(checkResults, 200);
-  
+
+  // Poll for model ready — onChanged can miss the transition
+  const scanInterval = setInterval(() => {
+    if (initialScanDone) {
+      clearInterval(scanInterval);
+      return;
+    }
+    scan();
+  }, 1000);
+
   chrome.storage.onChanged.addListener((changes) => {
     if (changes.modelStatus?.newValue?.status === 'ready' && !initialScanDone) {
       scan();
     }
   });
-  
+
+  // Watch for dynamically added images (SPAs load GIFs after content script)
+  let scanDebounce = null;
+  const observer = new MutationObserver((mutations) => {
+    if (initialScanDone) return;
+    // Check if any added nodes contain images
+    let hasNewImages = false;
+    for (const m of mutations) {
+      for (const node of m.addedNodes) {
+        if (node.nodeName === 'IMG' || (node.querySelectorAll && node.querySelectorAll('img').length > 0)) {
+          hasNewImages = true;
+          break;
+        }
+      }
+      if (hasNewImages) break;
+    }
+    if (hasNewImages) {
+      clearTimeout(scanDebounce);
+      scanDebounce = setTimeout(() => {
+        logTiming('MutationObserver: new images detected, scanning...');
+        scan();
+      }, 500);
+    }
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+
   scan();
 } else {
   console.error('[GIF] Extension context invalid!');
