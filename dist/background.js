@@ -1,63 +1,57 @@
-// Background service worker - handles storage proxy for offscreen document
+// Background service worker - opens inference tab for WebGPU-accelerated SmolVLM
 
 console.log('[BG] Background started');
 
-async function setupOffscreenDocument() {
-  const contexts = await chrome.runtime.getContexts({
-    contextTypes: ['OFFSCREEN_DOCUMENT']
-  });
-  
-  if (contexts.length > 0) {
-    console.log('[BG] Offscreen exists');
+let inferenceTabId = null;
+
+async function findInferenceTab() {
+  const tabs = await chrome.tabs.query({ url: chrome.runtime.getURL('inference.html') });
+  if (tabs.length > 0) {
+    inferenceTabId = tabs[0].id;
+    return true;
+  }
+  return false;
+}
+
+async function ensureInferenceTab() {
+  // Check if tab still exists
+  if (inferenceTabId) {
+    try {
+      await chrome.tabs.get(inferenceTabId);
+      return;
+    } catch (e) {
+      inferenceTabId = null;
+    }
+  }
+
+  // Check if already open
+  if (await findInferenceTab()) {
+    console.log('[BG] Inference tab found');
     return;
   }
-  
-  console.log('[BG] Creating offscreen...');
-  await chrome.offscreen.createDocument({
-    url: 'offscreen.html',
-    reasons: ['WORKERS'],
-    justification: 'ML model for GIF captioning'
+
+  // Open new tab
+  console.log('[BG] Opening inference tab...');
+  const tab = await chrome.tabs.create({
+    url: chrome.runtime.getURL('inference.html'),
+    active: false,  // Open in background
+    pinned: true,
   });
-  console.log('[BG] Offscreen created');
+  inferenceTabId = tab.id;
+  console.log('[BG] Inference tab opened (id=' + tab.id + ')');
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   console.log('[BG] Message:', msg.type);
-  
+
   if (msg.type === 'loadModel') {
-    // If model fell back to WASM, restart offscreen to retry WebGPU
-    chrome.storage.local.get('modelStatus', async (data) => {
-      const status = data.modelStatus || {};
-      if (status.device === 'wasm' && status.status === 'ready') {
-        console.log('[BG] Model on WASM, restarting offscreen for WebGPU...');
-        try {
-          await chrome.offscreen.closeDocument();
-        } catch (e) {}
-        resetStorage();
-      }
-      await setupOffscreenDocument();
-      setTimeout(() => {
-        chrome.runtime.sendMessage({ target: 'offscreen', type: 'loadModel' });
-      }, 500);
-    });
-    sendResponse({ success: true });
-    return true;
-  }
-  
-  if (msg.type === 'STORAGE_GET') {
-    chrome.storage.local.get(msg.keys, (data) => {
-      sendResponse({ success: true, data });
-    });
-    return true;
-  }
-  
-  if (msg.type === 'STORAGE_SET') {
-    chrome.storage.local.set(msg.data, () => {
+    ensureInferenceTab().then(() => {
+      // The inference page auto-loads the model on open
       sendResponse({ success: true });
     });
     return true;
   }
-  
+
   if (msg.type === 'keepAlive') {
     sendResponse({ alive: true });
     return true;
@@ -73,11 +67,13 @@ function resetStorage() {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  console.log('[BG] Installed — clearing storage');
+  console.log('[BG] Installed — clearing storage & opening inference tab');
   resetStorage();
+  ensureInferenceTab();
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  console.log('[BG] Browser started — clearing stale queue');
+  console.log('[BG] Browser started — clearing stale queue & opening inference tab');
   resetStorage();
+  ensureInferenceTab();
 });
