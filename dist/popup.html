@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body { width: 300px; padding: 16px; font: 14px system-ui; }
+    h1 { font-size: 16px; margin: 0 0 12px; }
+    .status { padding: 10px; border-radius: 6px; margin-bottom: 12px; }
+    .idle { background: #f0f0f0; }
+    .loading { background: #fff3cd; }
+    .ready { background: #d4edda; color: #155724; }
+    .error { background: #f8d7da; color: #721c24; }
+    button { width: 100%; padding: 10px; background: #6c5ce7; color: white; border: none; border-radius: 6px; cursor: pointer; }
+    button:disabled { background: #ccc; }
+    .progress { height: 6px; background: #e0e0e0; border-radius: 3px; margin-top: 8px; display: none; }
+    .fill { height: 100%; background: #6c5ce7; border-radius: 3px; }
+    .stats { margin-top: 12px; font-size: 12px; color: #666; }
+  </style>
+</head>
+<body>
+  <h1>🎬 GIF Reader</h1>
+  <div id="status" class="status idle">Click to load model</div>
+  <div id="progress" class="progress"><div id="fill" class="fill"></div></div>
+  <button id="btn">Load SmolVLM</button>
+  <div class="stats">
+    <div>Device: <span id="device">-</span></div>
+    <div>Captions: <span id="count">0</span></div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

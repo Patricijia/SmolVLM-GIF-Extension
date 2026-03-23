@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>GIF Reader - Inference</title>
+  <style>
+    body { font: 14px system-ui; padding: 20px; background: #1a1a2e; color: #e0e0e0; }
+    h1 { color: #6c5ce7; }
+    #log { font-family: monospace; font-size: 12px; white-space: pre-wrap; max-height: 400px; overflow-y: auto; background: #16213e; padding: 12px; border-radius: 6px; }
+    .status { padding: 8px 12px; border-radius: 6px; display: inline-block; margin-bottom: 12px; }
+    .loading { background: #fff3cd; color: #856404; }
+    .ready { background: #d4edda; color: #155724; }
+    .error { background: #f8d7da; color: #721c24; }
+  </style>
+</head>
+<body>
+  <h1>GIF Reader - SmolVLM Inference</h1>
+  <div id="statusBadge" class="status loading">Loading...</div>
+  <p>This tab runs the SmolVLM model. Keep it open for GIF captioning to work.</p>
+  <div id="log"></div>
+  <script src="inference.js" type="module"></script>
+</body>
+</html>
