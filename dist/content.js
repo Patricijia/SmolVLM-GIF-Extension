@@ -663,7 +663,7 @@
     if (!firstCaptionTime) {
       firstCaptionTime = performance.now() - PAGE_LOAD_TIME;
     }
-    logTiming("\u2713 [" + totalCaptioned + "/" + totalGifsFound + '] "' + caption + '" (' + time + "ms)");
+    logTiming("\u2713 [" + totalCaptioned + "/" + totalGifsFound + "] URL=" + img.src + ' CAPTION="' + caption + '" (' + time + "ms)");
     if (totalCaptioned >= totalGifsFound && totalGifsFound > 0) {
       printSummary();
     }
@@ -739,40 +739,36 @@
     ctx.drawImage(gridCanvas, offsetX, offsetY, finalW, finalH);
     return canvas.toDataURL("image/jpeg", 0.85);
   }
-  function renderSingleFrame(frames) {
-    const midIndex = Math.floor(frames.length / 2);
-    const firstFrame = frames[0];
-    const gifWidth = firstFrame.dims.width;
-    const gifHeight = firstFrame.dims.height;
+  function compositeFrames(frames, toIndex) {
+    const gifWidth = frames[0].dims.width;
+    const gifHeight = frames[0].dims.height;
     const canvas = document.createElement("canvas");
     canvas.width = gifWidth;
     canvas.height = gifHeight;
     const ctx = canvas.getContext("2d");
-    const tempCanvas = document.createElement("canvas");
-    tempCanvas.width = gifWidth;
-    tempCanvas.height = gifHeight;
-    const tempCtx = tempCanvas.getContext("2d");
-    for (let i = 0; i <= midIndex; i++) {
+    for (let i = 0; i <= toIndex; i++) {
       const f = frames[i];
-      const imageData = new ImageData(
-        new Uint8ClampedArray(f.patch),
-        f.dims.width,
-        f.dims.height
+      ctx.putImageData(
+        new ImageData(new Uint8ClampedArray(f.patch), f.dims.width, f.dims.height),
+        f.dims.left || 0,
+        f.dims.top || 0
       );
-      tempCtx.putImageData(imageData, f.dims.left || 0, f.dims.top || 0);
     }
-    ctx.drawImage(tempCanvas, 0, 0);
     return canvas.toDataURL("image/png");
   }
   async function getImageData(img) {
     try {
       const frames = await extractGifFrames(img.src);
       const grid = createGrid(frames);
-      const ocrFrame = renderSingleFrame(frames);
-      return { grid, ocrFrame };
+      const mid = Math.max(0, Math.floor(frames.length / 2) - 1);
+      const ocrFrames = [
+        compositeFrames(frames, 0),
+        compositeFrames(frames, mid)
+      ];
+      return { grid, ocrFrames };
     } catch (e) {
       const fallback = await getFallbackImageData(img);
-      return { grid: fallback, ocrFrame: fallback };
+      return { grid: fallback, ocrFrames: [fallback] };
     }
   }
   async function getFallbackImageData(img) {
@@ -813,14 +809,14 @@
     pending.set(id, img);
     try {
       logTiming("queueGif: extracting frames for " + id);
-      const { grid, ocrFrame } = await getImageData(img);
-      logTiming("queueGif: frames extracted, grid size=" + grid.length + " ocrFrame size=" + ocrFrame.length);
+      const { grid, ocrFrames } = await getImageData(img);
+      logTiming("queueGif: frames extracted, grid size=" + grid.length + " ocrFrames=" + ocrFrames.length);
       const storageData = await chrome.storage.local.get("captionQueue");
       const queue = storageData.captionQueue || [];
       if (priority) {
-        queue.unshift({ gifId: id, imageData: grid, ocrImage: ocrFrame });
+        queue.unshift({ gifId: id, imageData: grid, ocrFrames });
       } else {
-        queue.push({ gifId: id, imageData: grid, ocrImage: ocrFrame });
+        queue.push({ gifId: id, imageData: grid, ocrFrames });
       }
       await chrome.storage.local.set({ captionQueue: queue });
       logTiming("queueGif: " + id + " added to queue (length=" + queue.length + ")");
@@ -891,6 +887,20 @@
   }
   if (isContextValid()) {
     logTiming("Initializing...");
+    (async () => {
+      const pageModelId = window.localStorage?.getItem("gif_model_id");
+      if (pageModelId) {
+        const stored = await chrome.storage.local.get("selectedModelId");
+        if (stored.selectedModelId !== pageModelId) {
+          await chrome.storage.local.set({
+            selectedModelId: pageModelId,
+            captionQueue: [],
+            captionResults: {}
+          });
+          logTiming("Model switched to: " + pageModelId);
+        }
+      }
+    })();
     setInterval(checkResults, 200);
     const scanInterval = setInterval(() => {
       if (initialScanDone) {

@@ -14,11 +14,19 @@ async function findInferenceTab() {
 }
 
 async function ensureInferenceTab() {
-  // Check if tab still exists
+  const inferenceUrl = chrome.runtime.getURL('inference.html');
+
+  // Check if tab still exists and is actually showing inference.html (not a crash/error page)
   if (inferenceTabId) {
     try {
-      await chrome.tabs.get(inferenceTabId);
-      return;
+      const tab = await chrome.tabs.get(inferenceTabId);
+      if (tab.url && tab.url.startsWith(inferenceUrl)) {
+        return;
+      }
+      // Tab exists but shows error page — close it and reopen
+      console.log('[BG] Inference tab crashed (' + tab.url + '), reopening...');
+      await chrome.tabs.remove(inferenceTabId).catch(() => {});
+      inferenceTabId = null;
     } catch (e) {
       inferenceTabId = null;
     }
@@ -66,14 +74,24 @@ function resetStorage() {
   });
 }
 
-chrome.runtime.onInstalled.addListener(() => {
+async function closeAllInferenceTabs() {
+  const tabs = await chrome.tabs.query({ url: chrome.runtime.getURL('inference.html') });
+  for (const tab of tabs) {
+    await chrome.tabs.remove(tab.id).catch(() => {});
+  }
+  inferenceTabId = null;
+}
+
+chrome.runtime.onInstalled.addListener(async () => {
   console.log('[BG] Installed — clearing storage & opening inference tab');
+  await closeAllInferenceTabs();
   resetStorage();
   ensureInferenceTab();
 });
 
-chrome.runtime.onStartup.addListener(() => {
+chrome.runtime.onStartup.addListener(async () => {
   console.log('[BG] Browser started — clearing stale queue & opening inference tab');
+  await closeAllInferenceTabs();
   resetStorage();
   ensureInferenceTab();
 });

@@ -18,7 +18,7 @@ let gifsFoundTime = null;
 // Settings
 const MAX_GIFS = 10;
 
-// Grid settings
+// Grid settings — must match training data preprocessing (tgif dataset script)
 const NUM_FRAMES = 16;
 const GRID_ROWS = 4;
 const GRID_COLS = 4;
@@ -90,7 +90,7 @@ function applyCaption(img, caption, time) {
     firstCaptionTime = performance.now() - PAGE_LOAD_TIME;
   }
 
-  logTiming('✓ [' + totalCaptioned + '/' + totalGifsFound + '] "' + caption + '" (' + time + 'ms)');
+  logTiming('✓ [' + totalCaptioned + '/' + totalGifsFound + '] URL=' + img.src + ' CAPTION="' + caption + '" (' + time + 'ms)');
 
   if (totalCaptioned >= totalGifsFound && totalGifsFound > 0) {
     printSummary();
@@ -188,50 +188,39 @@ function createGrid(frames) {
   return canvas.toDataURL('image/jpeg', 0.85);
 }
 
-function renderSingleFrame(frames) {
-  // Composite frames up to the middle to get a full image
-  // (individual frames can be tiny delta patches)
-  const midIndex = Math.floor(frames.length / 2);
-  const firstFrame = frames[0];
-
-  // Use the first frame to determine full GIF dimensions
-  const gifWidth = firstFrame.dims.width;
-  const gifHeight = firstFrame.dims.height;
-
+// Composite GIF frames 0..toIndex onto a canvas at native GIF dimensions.
+function compositeFrames(frames, toIndex) {
+  const gifWidth = frames[0].dims.width;
+  const gifHeight = frames[0].dims.height;
   const canvas = document.createElement('canvas');
   canvas.width = gifWidth;
   canvas.height = gifHeight;
   const ctx = canvas.getContext('2d');
-
-  // Composite from frame 0 to mid frame
-  const tempCanvas = document.createElement('canvas');
-  tempCanvas.width = gifWidth;
-  tempCanvas.height = gifHeight;
-  const tempCtx = tempCanvas.getContext('2d');
-
-  for (let i = 0; i <= midIndex; i++) {
+  for (let i = 0; i <= toIndex; i++) {
     const f = frames[i];
-    const imageData = new ImageData(
-      new Uint8ClampedArray(f.patch),
-      f.dims.width,
-      f.dims.height
+    ctx.putImageData(
+      new ImageData(new Uint8ClampedArray(f.patch), f.dims.width, f.dims.height),
+      f.dims.left || 0, f.dims.top || 0
     );
-    tempCtx.putImageData(imageData, f.dims.left || 0, f.dims.top || 0);
   }
-
-  ctx.drawImage(tempCanvas, 0, 0);
-  return canvas.toDataURL('image/png');
+  return canvas.toDataURL('image/png'); // PNG = lossless, best for OCR
 }
 
 async function getImageData(img) {
   try {
     const frames = await extractGifFrames(img.src);
     const grid = createGrid(frames);
-    const ocrFrame = renderSingleFrame(frames);
-    return { grid, ocrFrame };
+    // Two high-quality frames for TrOCR: frame 0 and the mid frame.
+    // Different frames often carry different text overlays (subtitles, captions).
+    const mid = Math.max(0, Math.floor(frames.length / 2) - 1);
+    const ocrFrames = [
+      compositeFrames(frames, 0),
+      compositeFrames(frames, mid),
+    ];
+    return { grid, ocrFrames };
   } catch (e) {
     const fallback = await getFallbackImageData(img);
-    return { grid: fallback, ocrFrame: fallback };
+    return { grid: fallback, ocrFrames: [fallback] };
   }
 }
 
@@ -280,15 +269,15 @@ async function queueGif(img, priority) {
 
   try {
     logTiming('queueGif: extracting frames for ' + id);
-    const { grid, ocrFrame } = await getImageData(img);
-    logTiming('queueGif: frames extracted, grid size=' + grid.length + ' ocrFrame size=' + ocrFrame.length);
+    const { grid, ocrFrames } = await getImageData(img);
+    logTiming('queueGif: frames extracted, grid size=' + grid.length + ' ocrFrames=' + ocrFrames.length);
     const storageData = await chrome.storage.local.get('captionQueue');
     const queue = storageData.captionQueue || [];
 
     if (priority) {
-      queue.unshift({ gifId: id, imageData: grid, ocrImage: ocrFrame });
+      queue.unshift({ gifId: id, imageData: grid, ocrFrames });
     } else {
-      queue.push({ gifId: id, imageData: grid, ocrImage: ocrFrame });
+      queue.push({ gifId: id, imageData: grid, ocrFrames });
     }
 
     await chrome.storage.local.set({ captionQueue: queue });
@@ -375,6 +364,23 @@ async function scan() {
 
 if (isContextValid()) {
   logTiming('Initializing...');
+
+  // Sync model preference from page localStorage to extension storage.
+  // If the model changed, clear old captions so they are regenerated.
+  (async () => {
+    const pageModelId = window.localStorage?.getItem('gif_model_id');
+    if (pageModelId) {
+      const stored = await chrome.storage.local.get('selectedModelId');
+      if (stored.selectedModelId !== pageModelId) {
+        await chrome.storage.local.set({
+          selectedModelId: pageModelId,
+          captionQueue: [],
+          captionResults: {},
+        });
+        logTiming('Model switched to: ' + pageModelId);
+      }
+    }
+  })();
 
   setInterval(checkResults, 200);
 

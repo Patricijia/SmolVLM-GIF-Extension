@@ -11,7 +11,9 @@ env.backends.onnx.wasm.numThreads = navigator.hardwareConcurrency || 4;
 env.allowLocalModels = false;
 env.useBrowserCache = true;
 
-const MODEL_ID = 'HuggingFaceTB/SmolVLM-256M-Instruct';
+const DEFAULT_MODEL_ID = 'Patricijia/smolvlm-gif-descriptor';
+let MODEL_ID = DEFAULT_MODEL_ID;
+let PROCESSOR_ID = DEFAULT_MODEL_ID;
 
 let processor = null;
 let model = null;
@@ -21,6 +23,20 @@ let captionCount = 0;
 let isGenerating = false;
 let device = 'unknown';
 let consecutiveErrors = 0;
+const BATCH_SIZE = 3;
+
+// OCR pre-cache: Tesseract jobs are started as soon as items enter the queue so
+// the OCR worker runs ahead of the GPU caption batches (no ONNX conflict —
+// Tesseract uses its own WASM binary, separate from ONNX Runtime).
+const ocrCache = new Map();
+
+function precomputeOcr(item) {
+  if (ocrWorker && !ocrCache.has(item.gifId)) {
+    const frames = item.ocrFrames || (item.ocrImage ? [item.ocrImage] : [item.imageData]);
+    ocrCache.set(item.gifId, extractTextBestOf(frames));
+  }
+  return ocrCache.get(item.gifId) || Promise.resolve('');
+}
 
 const logEl = document.getElementById('log');
 const statusBadge = document.getElementById('statusBadge');
@@ -41,6 +57,17 @@ function setStatus(text, cls) {
 }
 
 log('[INF] ========== INFERENCE PAGE STARTED ==========');
+
+// Show any error saved from a previous WebGPU attempt
+(async () => {
+  const d = await getStorage('lastWebGPUError');
+  if (d.lastWebGPUError) {
+    const e = d.lastWebGPUError;
+    log('[INF] ⚠ PREVIOUS WEBGPU FAILURE (device=' + e.device + ' dtype=' + e.dtype + '): ' + e.msg);
+    if (e.stack) log('[INF] Stack: ' + e.stack.split('\n').slice(0, 3).join(' | '));
+    await setStorage({ lastWebGPUError: null });
+  }
+})();
 
 // ============================================================
 // STORAGE HELPERS
@@ -65,7 +92,7 @@ async function updateStatus(data) {
 }
 
 // ============================================================
-// OCR (Tesseract.js)
+// OCR (Tesseract.js — separate WASM binary, no ONNX conflict)
 // ============================================================
 
 async function initOCR() {
@@ -84,32 +111,6 @@ async function initOCR() {
     log('[INF] OCR init failed: ' + e.message);
     return false;
   }
-}
-
-function getImageDimensions(dataUrl) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
-    img.onerror = () => reject(new Error('Failed to load image'));
-    img.src = dataUrl;
-  });
-}
-
-function downscaleImage(dataUrl, maxWidth) {
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.onload = () => {
-      if (img.naturalWidth <= maxWidth) { resolve(dataUrl); return; }
-      const scale = maxWidth / img.naturalWidth;
-      const canvas = document.createElement('canvas');
-      canvas.width = Math.round(img.naturalWidth * scale);
-      canvas.height = Math.round(img.naturalHeight * scale);
-      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
-      resolve(canvas.toDataURL('image/png'));
-    };
-    img.onerror = () => resolve(dataUrl);
-    img.src = dataUrl;
-  });
 }
 
 function cleanOcrText(rawText) {
@@ -173,66 +174,100 @@ function isolateTextByColor(dataUrl) {
   });
 }
 
-async function extractText(imageData) {
+async function extractTextFromFrame(imageData) {
   if (!ocrWorker) return '';
   try {
-    const dims = await getImageDimensions(imageData);
-    if (dims.width < 100 || dims.height < 100) return '';
-    const scaled = await downscaleImage(imageData, 500);
-    const isolated = await isolateTextByColor(scaled);
+    const isolated = await isolateTextByColor(imageData);
     if (!isolated) return '';
     const [whiteResult, blackResult] = await Promise.all([
       ocrWorker.recognize(isolated.white),
-      ocrWorker.recognize(isolated.black)
+      ocrWorker.recognize(isolated.black),
     ]);
     const whiteText = cleanOcrText(whiteResult.data.text?.trim() || '');
     const blackText = cleanOcrText(blackResult.data.text?.trim() || '');
     return whiteText.length >= blackText.length ? whiteText : blackText;
-  } catch (e) {
+  } catch {
     return '';
   }
+}
+
+// Run OCR on all provided frames and return the longest result.
+// With 2 frames (first + mid), we catch text at different points in the animation.
+async function extractTextBestOf(frames) {
+  const results = await Promise.all(frames.map(f => extractTextFromFrame(f)));
+  return results.reduce((best, t) => t.length > best.length ? t : best, '');
 }
 
 // ============================================================
 // SmolVLM (main thread for WebGPU access)
 // ============================================================
 
-// Check if we should skip WebGPU (set after a failed attempt)
 const forceWasm = new URL(location.href).searchParams.has('wasm');
 
 async function loadModel() {
   if (isLoaded) return;
 
+  // Pick up any model preference set by the content script
+  const storedModel = await getStorage('selectedModelId');
+  if (storedModel.selectedModelId) {
+    MODEL_ID = storedModel.selectedModelId;
+    PROCESSOR_ID = storedModel.selectedModelId;
+  }
+
   log('[INF] Loading models...');
+  log('[INF] URL: ' + location.href);
+  log('[INF] forceWasm=' + forceWasm + ' navigator.gpu=' + (typeof navigator.gpu) + ' value=' + navigator.gpu);
   setStatus('Loading SmolVLM...', 'loading');
   const start = performance.now();
   await updateStatus({ status: 'loading', progress: 10 });
 
+  let useDevice = 'wasm';
+  let useDtype = 'q4';
+
   try {
-    // Decide device: try WebGPU unless we already know it fails.
-    // A failed WebGPU from_pretrained taints ONNX's internal wasmInitPromise,
-    // making WASM fallback impossible in the same page load. So if WebGPU
-    // fails, we reload the page with ?wasm to get a clean ONNX state.
-    let useDevice = 'wasm';
-    let useDtype = 'q4';
+    log('[INF] Checking WebGPU: forceWasm=' + forceWasm + ' hasGPU=' + !!navigator.gpu);
     if (!forceWasm && navigator.gpu) {
+      log('[INF] Entering WebGPU probe block');
       try {
-        const adapter = await navigator.gpu.requestAdapter();
-        if (adapter) {
-          const hasFp16 = adapter.features.has('shader-f16');
-          log('[INF] WebGPU adapter found, fp16=' + hasFp16);
-          if (hasFp16) {
-            // fp16: best option — works on Apple Silicon, modern NVIDIA/AMD
-            const gpuDevice = await adapter.requestDevice({ requiredFeatures: ['shader-f16'] });
-            gpuDevice.destroy();
-            useDevice = 'webgpu';
-            useDtype = 'fp16';
-            log('[INF] Will use WebGPU fp16');
-          } else {
-            // No fp16: fp32 works but needs >4GB VRAM, risky on small GPUs.
-            // q4 has no WebGPU kernels. Fall back to WASM.
-            log('[INF] No fp16 — falling back to WASM');
-          }
+        async function tryAdapter(preference) {
+          const a = await navigator.gpu.requestAdapter(preference ? { powerPreference: preference } : undefined);
+          if (!a) { log('[INF] requestAdapter(' + preference + ') returned null'); return null; }
+          const info = a.info || await a.requestAdapterInfo?.() || {};
+          const name = info.description || info.architecture || info.vendor || 'unknown';
+          // Do NOT call requestDevice here — adapters are single-use ("consumed" after first requestDevice).
+          // Just check the feature list directly; shader-f16 in features means fp16 is supported.
+          const fp16 = a.features?.has('shader-f16') ?? false;
+          log('[INF] adapter(' + preference + '): ' + name + ' fp16=' + fp16);
+          return { adapter: a, name, fp16 };
+        }
+
+        // On Optimus laptops the discrete GPU (high-performance) may not expose
+        // shader-f16 in Dawn even though the hardware supports it. Try it first,
+        // then fall back to the integrated GPU (low-power) which often exposes fp16
+        // through its Vulkan driver (e.g. Intel Iris Xe on this machine).
+        let best = await tryAdapter('high-performance');
+        log('[INF] high-performance adapter: ' + best?.name + ', fp16=' + best?.fp16);
+
+        if (!best?.fp16) {
+          const lp = await tryAdapter('low-power');
+          log('[INF] low-power adapter: ' + lp?.name + ', fp16=' + lp?.fp16);
+          if (lp?.fp16) best = lp; // prefer the adapter that actually has fp16
+        }
+
+        if (best?.fp16) {
+          useDevice = 'webgpu';
+          useDtype = 'fp16';
+          // transformers.js isWebGpuFp16Supported() calls navigator.gpu.requestAdapter()
+          // with no args and gets the default NVIDIA adapter (no shader-f16).
+          // Patch requestAdapter so every caller gets the Intel Xe adapter we probed.
+          navigator.gpu.requestAdapter = async () => best.adapter;
+          log('[INF] Will use WebGPU fp16 on: ' + best.name + ' (requestAdapter patched)');
+        } else {
+          // fp32 on WebGPU splits encoder/decoder into separate ONNX sessions which
+          // conflict under the JSEP backend ("Session already started"). Use WASM q8.
+          useDevice = 'wasm';
+          useDtype = 'q8';
+          log('[INF] No fp16 on any adapter — falling back to WASM q8');
         }
       } catch (e) {
         log('[INF] WebGPU probe failed: ' + e.message);
@@ -242,17 +277,53 @@ async function loadModel() {
     }
     log('[INF] Using: ' + useDevice + ' / ' + useDtype);
 
-    // Load processor, OCR, and model in parallel
-    log('[INF] Loading processor + OCR + SmolVLM (' + useDevice + ')...');
+    log('[INF] env.backends.onnx.wasm.wasmPaths=' + env.backends.onnx.wasm.wasmPaths);
+    log('[INF] Loading processor (device=' + useDevice + ' dtype=' + useDtype + ')...');
     await updateStatus({ status: 'loading', progress: 20 });
-    const [, , ] = await Promise.all([
-      AutoProcessor.from_pretrained(MODEL_ID).then(p => { processor = p; }),
-      initOCR(),
-      AutoModelForVision2Seq.from_pretrained(MODEL_ID, {
+
+    try {
+      log('[INF] Step 1: AutoProcessor.from_pretrained...');
+      processor = await AutoProcessor.from_pretrained(PROCESSOR_ID);
+      log('[INF] Step 1 done');
+    } catch (e) {
+      log('[INF] Step 1 FAILED: ' + e.message + '\n' + (e.stack || ''));
+      throw e;
+    }
+
+    try {
+      log('[INF] Step 2: AutoModelForVision2Seq.from_pretrained (device=' + useDevice + ' dtype=' + useDtype + ')...');
+      model = await AutoModelForVision2Seq.from_pretrained(MODEL_ID, {
         dtype: useDtype,
         device: useDevice,
-      }).then(m => { model = m; }),
-    ]);
+      });
+      log('[INF] Step 2 done');
+    } catch (e) {
+      log('[INF] Step 2 FAILED: ' + e.message + '\n' + (e.stack || ''));
+      if (useDevice === 'webgpu') {
+        log('[INF] WebGPU model load failed — retrying with WASM q8 (no page reload)...');
+        useDevice = 'wasm'; useDtype = 'q8';
+        try {
+          log('[INF] Step 2 retry: WASM q8...');
+          model = await AutoModelForVision2Seq.from_pretrained(MODEL_ID, { dtype: 'q8', device: 'wasm' });
+          log('[INF] Step 2 retry done');
+        } catch (e2) {
+          log('[INF] Step 2 retry FAILED: ' + e2.message);
+          throw e2;
+        }
+      } else {
+        throw e;
+      }
+    }
+
+    try {
+      log('[INF] Step 3: initOCR...');
+      await initOCR();
+      log('[INF] Step 3 done');
+    } catch (e) {
+      log('[INF] Step 3 FAILED (OCR): ' + e.message);
+      // OCR is optional — continue without it
+    }
+
     device = useDevice;
     log('[INF] ✅ SmolVLM loaded (' + device + ' ' + useDtype + ')');
 
@@ -265,63 +336,14 @@ async function loadModel() {
     processQueue();
 
   } catch (err) {
-    log('[INF] Load failed: ' + err.message);
-
-    // If WebGPU was attempted and failed, reload with clean ONNX state for WASM
-    if (!forceWasm && err.message.includes('webgpu')) {
-      log('[INF] WebGPU runtime failed — reloading in WASM mode...');
-      await updateStatus({ status: 'loading', progress: 5, message: 'Falling back to WASM...' });
-      const wasmUrl = chrome.runtime.getURL('inference.html') + '?wasm';
-      location.replace(wasmUrl);
-      return;
-    }
-
+    log('[INF] Fatal load error: ' + err.message + '\n' + (err.stack || ''));
     setStatus('Error: ' + err.message, 'error');
     await updateStatus({ status: 'error', message: err.message });
   }
 }
 
 // ============================================================
-// GENERATE CAPTION
-// ============================================================
-
-async function generateCaption(imageData) {
-  const messages = [
-    {
-      role: 'user',
-      content: [
-        { type: 'image' },
-        { type: 'text', text: 'Describe this GIF briefly.' },
-      ],
-    },
-  ];
-
-  const text = processor.apply_chat_template(messages, { add_generation_prompt: true });
-  const image = await load_image(imageData);
-  const inputs = await processor(text, [image]);
-
-  log('[INF] Running model.generate...');
-  const genStart = performance.now();
-
-  const output = await model.generate({
-    ...inputs,
-    do_sample: false,
-    max_new_tokens: 20,
-    repetition_penalty: 1.1,
-  });
-
-  const genTime = Math.round(performance.now() - genStart);
-  log('[INF] Generation took ' + genTime + 'ms');
-
-  const decoded = processor.batch_decode(output, { skip_special_tokens: true });
-  const fullText = decoded[0] || '';
-  const assistantIdx = fullText.lastIndexOf('Assistant:');
-  return (assistantIdx >= 0 ? fullText.slice(assistantIdx + 10) : fullText)
-    .trim().replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ');
-}
-
-// ============================================================
-// CAPTION + OCR
+// GENERATE CAPTIONS (batched SmolVLM)
 // ============================================================
 
 const CAPTION_TIMEOUT_MS = 300000;
@@ -334,43 +356,60 @@ function withTimeout(promise, ms) {
   ]).finally(() => clearTimeout(timer));
 }
 
-async function generateCaptionWithOCR(imageData, ocrImage) {
-  if (!isLoaded || !model || !processor) return { error: 'Not loaded' };
-  if (isGenerating) return { error: 'Busy' };
+const CAPTION_PROMPT_TEXT = 'These frames are ordered left to right over time. Describe these frames in a short, simple sentence (max 10 words), similar to: \'a man walks across the room\'. Use plain language and do not add extra commentary.';
 
-  isGenerating = true;
-  const start = performance.now();
+// SmolVLM/Idefics3 hardcoded format — used when tokenizer.chat_template is missing from fine-tuned repo
+const SMOLVLM_TEMPLATE_FALLBACK = '<|im_start|>User:<image>' + CAPTION_PROMPT_TEXT + '<end_of_utterance>\nAssistant:';
 
-  try {
-    const [caption, ocrText] = await withTimeout(
-      Promise.all([
-        generateCaption(imageData),
-        ocrWorker ? extractText(ocrImage || imageData) : Promise.resolve('')
-      ]),
-      CAPTION_TIMEOUT_MS
-    );
+let captionTemplate = null;
 
-    let finalCaption = 'Gif displays ' + caption;
-    if (ocrText && ocrText.length > 3) {
-      finalCaption += ' with text ' + ocrText;
+function getCaptionTemplate() {
+  if (!captionTemplate) {
+    try {
+      captionTemplate = processor.apply_chat_template([{
+        role: 'user',
+        content: [{ type: 'image' }, { type: 'text', text: CAPTION_PROMPT_TEXT }],
+      }], { add_generation_prompt: true });
+      log('[INF] apply_chat_template succeeded');
+    } catch (e) {
+      log('[INF] apply_chat_template failed (' + e.message.slice(0, 60) + '), using hardcoded SmolVLM template');
+      captionTemplate = SMOLVLM_TEMPLATE_FALLBACK;
     }
-    finalCaption = finalCaption.replace(/\s+/g, ' ').trim();
-
-    const time = Math.round(performance.now() - start);
-    captionCount++;
-    consecutiveErrors = 0;
-    await updateStatus({ captionCount });
-
-    log('[INF] ✓ "' + finalCaption + '" (' + time + 'ms)');
-    isGenerating = false;
-    return { caption: finalCaption, ocrText, time };
-
-  } catch (err) {
-    log('[INF] Generate error: ' + err.message);
-    isGenerating = false;
-    consecutiveErrors++;
-    return { error: err.message };
   }
+  return captionTemplate;
+}
+
+async function generateCaptionBatch(imageDataArray) {
+  const t0 = performance.now();
+  const texts = imageDataArray.map(() => getCaptionTemplate());
+  const images = await Promise.all(imageDataArray.map(d => load_image(d)));
+  const t1 = performance.now();
+
+  const inputs = await processor(texts, images, { padding: true });
+  const t2 = performance.now();
+
+  // Log tensor shapes so we know how many visual tokens are produced
+  const pvShape = inputs.pixel_values?.dims ?? inputs.pixel_values?.shape ?? 'unknown';
+  const idsShape = inputs.input_ids?.dims ?? inputs.input_ids?.shape ?? 'unknown';
+  log('[INF] load_image=' + Math.round(t1-t0) + 'ms  processor=' + Math.round(t2-t1) + 'ms');
+  log('[INF] pixel_values shape=' + JSON.stringify(pvShape) + '  input_ids shape=' + JSON.stringify(idsShape));
+
+  log('[INF] Running generate (' + imageDataArray.length + ' items)...');
+  const genStart = performance.now();
+  const output = await model.generate({
+    ...inputs,
+    do_sample: false,
+    max_new_tokens: 20,
+    repetition_penalty: 1.3,
+  });
+  const genTime = Math.round(performance.now() - genStart);
+  log('[INF] generate=' + genTime + 'ms  total=' + Math.round(performance.now()-t0) + 'ms');
+
+  return processor.batch_decode(output, { skip_special_tokens: true }).map(fullText => {
+    const idx = fullText.lastIndexOf('Assistant:');
+    return (idx >= 0 ? fullText.slice(idx + 10) : fullText)
+      .trim().replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ');
+  });
 }
 
 // ============================================================
@@ -393,26 +432,62 @@ async function processQueue() {
 
         if (queue.length > 0) {
           logCounter = 0;
-          const item = queue.shift();
+          // WebGPU JSEP doesn't support concurrent ONNX sessions — batch=1 only.
+        // WASM can safely batch.
+        const batchSize = Math.min(device === 'webgpu' ? 1 : BATCH_SIZE, queue.length);
+          const batch = queue.splice(0, batchSize);
           await setStorage({ captionQueue: queue });
 
-          log('[INF] Processing: ' + item.gifId + ' (' + queue.length + ' left)');
-          const result = await generateCaptionWithOCR(item.imageData, item.ocrImage);
+          // Kick off OCR for current batch + all remaining queue items immediately.
+          // Tesseract runs in its own worker thread — no ONNX session conflict.
+          for (const item of [...batch, ...queue]) precomputeOcr(item);
 
-          if (!result.error) {
+          log('[INF] Processing batch of ' + batchSize + ' (' + queue.length + ' left)');
+          isGenerating = true;
+          const batchStart = performance.now();
+
+          try {
+            // SmolVLM (WebGPU) and Tesseract OCR run simultaneously.
+            const [captions, ocrTexts] = await withTimeout(
+              Promise.all([
+                generateCaptionBatch(batch.map(item => item.imageData)),
+                Promise.all(batch.map(item => precomputeOcr(item))),
+              ]),
+              CAPTION_TIMEOUT_MS
+            );
+
             const results = data.captionResults || {};
-            results[item.gifId] = result;
+            for (let i = 0; i < batch.length; i++) {
+              const item = batch[i];
+              ocrCache.delete(item.gifId);
+              let finalCaption = captions[i];
+              if (ocrTexts[i] && ocrTexts[i].length > 3) finalCaption += '. Text: ' + ocrTexts[i];
+              finalCaption = finalCaption.replace(/\s+/g, ' ').trim();
+              results[item.gifId] = { caption: finalCaption, ocrText: ocrTexts[i], time: 0 };
+              captionCount++;
+              log('[INF] ✓ [' + captionCount + '] "' + finalCaption + '"');
+            }
+
+            const batchTime = Math.round(performance.now() - batchStart);
+            log('[INF] Batch done in ' + batchTime + 'ms');
             await setStorage({ captionResults: results });
-          } else {
-            log('[INF] Failed: ' + result.error + ' (errors=' + consecutiveErrors + ')');
+            await updateStatus({ captionCount });
+            consecutiveErrors = 0;
+
+          } catch (err) {
+            log('[INF] Batch failed: ' + err.message);
+            consecutiveErrors++;
             if (consecutiveErrors < 3) {
               const currentData = await getStorage('captionQueue');
               const currentQueue = currentData.captionQueue || [];
-              currentQueue.push(item);
+              currentQueue.unshift(...batch);
               await setStorage({ captionQueue: currentQueue });
             } else {
-              log('[INF] Dropping ' + item.gifId);
+              log('[INF] Dropping batch (' + batch.map(b => b.gifId).join(', ') + ')');
+              for (const item of batch) ocrCache.delete(item.gifId);
             }
+          } finally {
+            isGenerating = false;
           }
         }
       }
@@ -437,6 +512,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ alive: true, device, captionCount, isLoaded });
   }
   return true;
+});
+
+// Reload the inference page when the user switches models from the test bench.
+// Reloading the page is the only reliable way to fully dispose WebGPU/ONNX sessions.
+chrome.storage.onChanged.addListener((changes) => {
+  if (changes.selectedModelId) {
+    const newId = changes.selectedModelId.newValue;
+    if (newId && newId !== MODEL_ID) {
+      log('[INF] Model switch detected: ' + newId + ' — reloading page...');
+      location.reload();
+    }
+  }
 });
 
 loadModel();
