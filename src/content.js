@@ -1,430 +1,271 @@
-import { parseGIF, decompressFrames } from 'gifuct-js';
+/**
+ * SmolVLM Content Script - detects GIFs and requests captions.
+ * Same architecture as vit-gpt2 extension:
+ *   Detect GIF → send DESCRIBE_GIF → get { caption, metrics } → apply
+ */
+const PAGE_START = performance.now();
+console.log('[GIF] SmolVLM GIF Accessibility Reader running...');
 
-console.log('[GIF] ========== CONTENT SCRIPT LOADED ==========');
+// OCR can be disabled via ?ocr=off in the page URL — used by latency-benchmark.
+const OCR_ENABLED = new URLSearchParams(window.location.search).get('ocr') !== 'off';
+console.log('[GIF] OCR ' + (OCR_ENABLED ? 'enabled' : 'disabled'));
 
-const PAGE_LOAD_TIME = performance.now();
-const processed = new Set();
-const pending = new Map();
+// Auto-benchmark: total runs (override with ?runs=N) and delay between refreshes.
+const BENCHMARK_TOTAL_RUNS = parseInt(new URLSearchParams(window.location.search).get('runs') || '51', 10);
+const BENCHMARK_DELAY_MS = 10000;
+const RUN_KEY = 'benchmarkRun-ocr-' + (OCR_ENABLED ? 'on' : 'off');
 
-let firstCaptionTime = null;
-let allCaptionsTime = null;
-let totalGifsFound = 0;
-let totalCaptioned = 0;
-let initialScanDone = false;
-let modelReadyTime = null;
-let modelDevice = 'unknown';
-let gifsFoundTime = null;
+const seen = new Set();
+const retryCount = new Map();
+const MAX_RETRIES = 10;
+let labelsApplied = 0;
+let totalGifs = 0;
 
-// Settings
-const MAX_GIFS = 10;
-
-// Grid settings — must match training data preprocessing (tgif dataset script)
-const NUM_FRAMES = 16;
-const GRID_ROWS = 4;
-const GRID_COLS = 4;
-const CELL_SIZE = 128;
-const FINAL_SIZE = 512;
-const PAD_BETWEEN_FRAMES = 4;
-const PAD_COLOR = '#000000';
-
-function logTiming(event) {
-  const elapsed = Math.round(performance.now() - PAGE_LOAD_TIME);
-  console.log('[GIF] [' + elapsed + 'ms] ' + event);
-}
-
-function isContextValid() {
+// Collect metrics for final summary. Mirrored to a DOM data attribute so
+// puppeteer benchmarks (which run in the page's isolated world) can read it.
+const allMetrics = [];
+function publishMetrics() {
   try {
-    return !!chrome.runtime?.id;
-  } catch {
-    return false;
-  }
+    document.documentElement.dataset.gifMetrics = JSON.stringify(allMetrics);
+  } catch {}
 }
+let firstModelLoadMs = null;
+let firstOcrLoadMs = null;
 
-async function getModelStatus() {
-  if (!isContextValid()) return null;
-  try {
-    const data = await chrome.storage.local.get('modelStatus');
-    return data.modelStatus || null;
-  } catch {
-    return null;
-  }
-}
+async function labelGif(gif) {
+  const url = gif.src;
+  if (seen.has(url)) return;
+  seen.add(url);
 
-function isInViewport(img) {
-  const rect = img.getBoundingClientRect();
-  return (
-    rect.top < window.innerHeight &&
-    rect.bottom > 0 &&
-    rect.left < window.innerWidth &&
-    rect.right > 0
-  );
-}
-
-function printSummary() {
-  if (allCaptionsTime) return;
-
-  allCaptionsTime = performance.now() - PAGE_LOAD_TIME;
-  const captioningTime = gifsFoundTime ? (allCaptionsTime - gifsFoundTime) : allCaptionsTime;
-
-  console.log('[GIF] ═══════════════════════════════════════');
-  console.log('[GIF] 🎉 ACCESSIBILITY READY');
-  console.log('[GIF]   Page load → ready: ' + (allCaptionsTime / 1000).toFixed(1) + 's');
-  console.log('[GIF]   Model load: ' + ((modelReadyTime || 0) / 1000).toFixed(1) + 's');
-  console.log('[GIF]   First caption: ' + ((firstCaptionTime || 0) / 1000).toFixed(1) + 's');
-  console.log('[GIF]   Captioning: ' + (captioningTime / 1000).toFixed(1) + 's');
-  console.log('[GIF]   GIFs: ' + totalCaptioned + ' (' + modelDevice + ')');
-  if (totalCaptioned > 0) {
-    console.log('[GIF]   Avg: ' + Math.round(captioningTime / totalCaptioned) + 'ms/GIF');
-  }
-  console.log('[GIF] ═══════════════════════════════════════');
-}
-
-function applyCaption(img, caption, time) {
-  img.alt = caption;
-  img.setAttribute('aria-label', caption);
-  img.setAttribute('role', 'img');
-  img.setAttribute('tabindex', '0');
-
-  totalCaptioned++;
-  if (!firstCaptionTime) {
-    firstCaptionTime = performance.now() - PAGE_LOAD_TIME;
-  }
-
-  logTiming('✓ [' + totalCaptioned + '/' + totalGifsFound + '] URL=' + img.src + ' CAPTION="' + caption + '" (' + time + 'ms)');
-
-  if (totalCaptioned >= totalGifsFound && totalGifsFound > 0) {
-    printSummary();
-  }
-}
-
-async function extractGifFrames(gifUrl) {
-  const response = await fetch(gifUrl, { mode: 'cors' });
-  if (!response.ok) throw new Error('Fetch failed');
-  
-  const buffer = await response.arrayBuffer();
-  const gif = parseGIF(buffer);
-  const frames = decompressFrames(gif, true);
-  
-  if (!frames || frames.length === 0) {
-    throw new Error('No frames');
-  }
-  
-  return frames;
-}
-
-function renderFrame(frame, canvas, ctx) {
-  const { width, height } = frame.dims;
-  
-  if (canvas.width !== width || canvas.height !== height) {
-    canvas.width = width;
-    canvas.height = height;
-  }
-  
-  const imageData = new ImageData(
-    new Uint8ClampedArray(frame.patch),
-    frame.dims.width,
-    frame.dims.height
-  );
-  
-  ctx.putImageData(imageData, frame.dims.left || 0, frame.dims.top || 0);
-}
-
-function letterboxToCell(destCtx, srcCanvas, cellX, cellY, cellSize) {
-  const scale = Math.min(cellSize / srcCanvas.width, cellSize / srcCanvas.height);
-  const w = srcCanvas.width * scale;
-  const h = srcCanvas.height * scale;
-  const x = cellX + (cellSize - w) / 2;
-  const y = cellY + (cellSize - h) / 2;
-  
-  destCtx.drawImage(srcCanvas, x, y, w, h);
-}
-
-function createGrid(frames) {
-  const gridW = GRID_COLS * CELL_SIZE + (GRID_COLS - 1) * PAD_BETWEEN_FRAMES;
-  const gridH = GRID_ROWS * CELL_SIZE + (GRID_ROWS - 1) * PAD_BETWEEN_FRAMES;
-  
-  const canvas = document.createElement('canvas');
-  canvas.width = FINAL_SIZE;
-  canvas.height = FINAL_SIZE;
-  const ctx = canvas.getContext('2d');
-  ctx.fillStyle = PAD_COLOR;
-  ctx.fillRect(0, 0, FINAL_SIZE, FINAL_SIZE);
-  
-  const gridCanvas = document.createElement('canvas');
-  gridCanvas.width = gridW;
-  gridCanvas.height = gridH;
-  const gridCtx = gridCanvas.getContext('2d');
-  gridCtx.fillStyle = PAD_COLOR;
-  gridCtx.fillRect(0, 0, gridW, gridH);
-  
-  const frameCanvas = document.createElement('canvas');
-  const frameCtx = frameCanvas.getContext('2d');
-  
-  const indices = [];
-  const step = Math.max(1, (frames.length - 1) / (NUM_FRAMES - 1));
-  for (let i = 0; i < NUM_FRAMES; i++) {
-    indices.push(Math.min(Math.floor(i * step), frames.length - 1));
-  }
-  
-  for (let i = 0; i < NUM_FRAMES; i++) {
-    const frame = frames[indices[i]];
-    const row = Math.floor(i / GRID_COLS);
-    const col = i % GRID_COLS;
-    const x = col * (CELL_SIZE + PAD_BETWEEN_FRAMES);
-    const y = row * (CELL_SIZE + PAD_BETWEEN_FRAMES);
-    
-    renderFrame(frame, frameCanvas, frameCtx);
-    letterboxToCell(gridCtx, frameCanvas, x, y, CELL_SIZE);
-  }
-  
-  const scale = Math.min(FINAL_SIZE / gridW, FINAL_SIZE / gridH);
-  const finalW = gridW * scale;
-  const finalH = gridH * scale;
-  const offsetX = (FINAL_SIZE - finalW) / 2;
-  const offsetY = (FINAL_SIZE - finalH) / 2;
-  
-  ctx.drawImage(gridCanvas, offsetX, offsetY, finalW, finalH);
-  
-  return canvas.toDataURL('image/jpeg', 0.85);
-}
-
-// Composite GIF frames 0..toIndex onto a canvas at native GIF dimensions.
-function compositeFrames(frames, toIndex) {
-  const gifWidth = frames[0].dims.width;
-  const gifHeight = frames[0].dims.height;
-  const canvas = document.createElement('canvas');
-  canvas.width = gifWidth;
-  canvas.height = gifHeight;
-  const ctx = canvas.getContext('2d');
-  for (let i = 0; i <= toIndex; i++) {
-    const f = frames[i];
-    ctx.putImageData(
-      new ImageData(new Uint8ClampedArray(f.patch), f.dims.width, f.dims.height),
-      f.dims.left || 0, f.dims.top || 0
-    );
-  }
-  return canvas.toDataURL('image/png'); // PNG = lossless, best for OCR
-}
-
-async function getImageData(img) {
-  try {
-    const frames = await extractGifFrames(img.src);
-    const grid = createGrid(frames);
-    // Two high-quality frames for TrOCR: frame 0 and the mid frame.
-    // Different frames often carry different text overlays (subtitles, captions).
-    const mid = Math.max(0, Math.floor(frames.length / 2) - 1);
-    const ocrFrames = [
-      compositeFrames(frames, 0),
-      compositeFrames(frames, mid),
-    ];
-    return { grid, ocrFrames };
-  } catch (e) {
-    const fallback = await getFallbackImageData(img);
-    return { grid: fallback, ocrFrames: [fallback] };
-  }
-}
-
-async function getFallbackImageData(img) {
-  return new Promise((resolve, reject) => {
-    const canvas = document.createElement('canvas');
-    canvas.width = canvas.height = FINAL_SIZE;
-    const ctx = canvas.getContext('2d');
-    
-    const corsImg = new Image();
-    corsImg.crossOrigin = 'anonymous';
-    
-    corsImg.onload = () => {
-      try {
-        ctx.fillStyle = PAD_COLOR;
-        ctx.fillRect(0, 0, FINAL_SIZE, FINAL_SIZE);
-        
-        const scale = Math.min(FINAL_SIZE / corsImg.naturalWidth, FINAL_SIZE / corsImg.naturalHeight);
-        const w = corsImg.naturalWidth * scale;
-        const h = corsImg.naturalHeight * scale;
-        ctx.drawImage(corsImg, (FINAL_SIZE - w) / 2, (FINAL_SIZE - h) / 2, w, h);
-        
-        resolve(canvas.toDataURL('image/jpeg', 0.85));
-      } catch (e) {
-        reject(e);
-      }
-    };
-    corsImg.onerror = () => reject(new Error('CORS'));
-    corsImg.src = img.src;
-  });
-}
-
-async function queueGif(img, priority) {
-  if (!isContextValid()) {
-    logTiming('queueGif: context invalid, skipping');
-    return;
-  }
-  if (processed.has(img.src)) {
-    logTiming('queueGif: already processed, skipping');
-    return;
-  }
-  processed.add(img.src);
-
-  const id = 'g' + Date.now() + Math.random().toString(36).slice(2, 6);
-  pending.set(id, img);
+  const t0 = performance.now();
 
   try {
-    logTiming('queueGif: extracting frames for ' + id);
-    const { grid, ocrFrames } = await getImageData(img);
-    logTiming('queueGif: frames extracted, grid size=' + grid.length + ' ocrFrames=' + ocrFrames.length);
-    const storageData = await chrome.storage.local.get('captionQueue');
-    const queue = storageData.captionQueue || [];
-
-    if (priority) {
-      queue.unshift({ gifId: id, imageData: grid, ocrFrames });
-    } else {
-      queue.push({ gifId: id, imageData: grid, ocrFrames });
-    }
-
-    await chrome.storage.local.set({ captionQueue: queue });
-    logTiming('queueGif: ' + id + ' added to queue (length=' + queue.length + ')');
-  } catch (e) {
-    logTiming('queueGif ERROR: ' + e.message);
-    processed.delete(img.src);
-    pending.delete(id);
-  }
-}
-
-async function checkResults() {
-  if (!isContextValid()) return;
-  
-  try {
-    const data = await chrome.storage.local.get('captionResults');
-    const results = data.captionResults || {};
-    
-    for (const id of Object.keys(results)) {
-      const r = results[id];
-      const img = pending.get(id);
-      
-      if (img && r?.caption) {
-        applyCaption(img, r.caption, r.time);
-        pending.delete(id);
-        delete results[id];
-        await chrome.storage.local.set({ captionResults: results });
-      }
-    }
-  } catch (e) {}
-}
-
-let isScanning = false;
-
-async function scan() {
-  if (initialScanDone || isScanning) return;
-  isScanning = true;
-
-  try {
-    const status = await getModelStatus();
-    if (!status || status.status !== 'ready') return;
-
-    if (!modelReadyTime) {
-      modelReadyTime = performance.now() - PAGE_LOAD_TIME;
-      modelDevice = status.device || 'unknown';
-      logTiming('Model ready! (' + modelDevice + ')');
-    }
-
-    const allImages = document.querySelectorAll('img');
-    const visibleGifs = [];
-    const hiddenGifs = [];
-
-    allImages.forEach(img => {
-      const src = img.src.toLowerCase();
-      const isGif = src.includes('.gif') || img.src.includes('.gif');
-      if (isGif && !processed.has(img.src) && img.naturalWidth > 100) {
-        if (isInViewport(img)) {
-          visibleGifs.push(img);
-        } else {
-          hiddenGifs.push(img);
-        }
-      }
+    const response = await chrome.runtime.sendMessage({
+      type: 'DESCRIBE_GIF',
+      url,
+      ocr: OCR_ENABLED,
     });
 
-    const allGifs = [...visibleGifs, ...hiddenGifs].slice(0, MAX_GIFS);
-    const visibleCount = Math.min(visibleGifs.length, MAX_GIFS);
+    if (response.error) throw new Error(response.error);
 
-    if (allGifs.length === 0) return;
+    const label = response.caption;
+    const metrics = response.metrics;
 
-    totalGifsFound = allGifs.length;
-    initialScanDone = true;
-    gifsFoundTime = performance.now() - PAGE_LOAD_TIME;
+    gif.alt = label;
+    gif.setAttribute('aria-label', label);
+    gif.setAttribute('role', 'img');
+    gif.setAttribute('tabindex', '0');
 
-    logTiming('Found ' + totalGifsFound + ' GIFs (' + visibleCount + ' visible)');
+    // Display label visually next to image (teal badge for SmolVLM)
+    const tag = document.createElement('span');
+    tag.innerText = label;
+    tag.style.cssText =
+      'background: #00c9a7; color: black; font-size: 12px; padding: 2px 4px; ' +
+      'position: absolute; z-index: 9999; border-radius: 4px; ' +
+      'left: ' + (gif.getBoundingClientRect().right + window.scrollX + 5) + 'px; ' +
+      'top: ' + (gif.getBoundingClientRect().top + window.scrollY) + 'px; ' +
+      'max-width: 300px; display: inline-block;';
+    document.body.appendChild(tag);
 
-    for (let i = 0; i < allGifs.length; i++) {
-      await queueGif(allGifs[i], i < visibleCount);
+    retryCount.delete(url);
+    labelsApplied++;
+
+    // Store metrics (same structure as vit-gpt2)
+    if (metrics) {
+      if (firstModelLoadMs === null) firstModelLoadMs = metrics.modelLoadMs;
+      if (firstOcrLoadMs === null) firstOcrLoadMs = metrics.ocrLoadMs;
+      allMetrics.push({
+        gifIndex: labelsApplied,
+        url: url.slice(0, 80),
+        caption: label,
+        ...metrics,
+        wallClockMs: Math.round(performance.now() - t0),
+        sincePageLoadMs: Math.round(performance.now() - PAGE_START),
+      });
+      publishMetrics();
     }
-    logTiming('All ' + totalGifsFound + ' GIFs queued');
-  } finally {
-    isScanning = false;
+
+    const elapsed = (performance.now() - t0).toFixed(0);
+    const sincePageLoad = (performance.now() - PAGE_START).toFixed(0);
+    console.log(
+      '[GIF] ' + labelsApplied + '/' + totalGifs + ' labeled in ' + elapsed + 'ms ' +
+      '(' + sincePageLoad + 'ms since load) | "' + label + '"' +
+      (metrics ? ' | grid: ' + metrics.frameExtractionMs + 'ms, inference: ' + metrics.totalInferenceMs + 'ms' +
+        ', OCR: ' + (metrics.ocrDetected ? '"' + metrics.ocrText + '"' : 'none') : '')
+    );
+
+    if (labelsApplied === totalGifs) {
+      printFinalSummary();
+    }
+  } catch (err) {
+    const attempts = (retryCount.get(url) || 0) + 1;
+    if (attempts < MAX_RETRIES) {
+      retryCount.set(url, attempts);
+      seen.delete(url);
+      console.warn('[GIF] Failed (attempt ' + attempts + '/' + MAX_RETRIES + '), retrying:', url, err);
+      labelGif(gif);
+    } else {
+      retryCount.delete(url);
+      console.error('[GIF] Failed: giving up after ' + MAX_RETRIES + ' attempts:', url, err);
+    }
   }
 }
 
-if (isContextValid()) {
-  logTiming('Initializing...');
+function printFinalSummary() {
+  const totalTime = Math.round(performance.now() - PAGE_START);
 
-  // Sync model preference from page localStorage to extension storage.
-  // If the model changed, clear old captions so they are regenerated.
-  (async () => {
-    const pageModelId = window.localStorage?.getItem('gif_model_id');
-    if (pageModelId) {
-      const stored = await chrome.storage.local.get('selectedModelId');
-      if (stored.selectedModelId !== pageModelId) {
-        await chrome.storage.local.set({
-          selectedModelId: pageModelId,
-          captionQueue: [],
-          captionResults: {},
-        });
-        logTiming('Model switched to: ' + pageModelId);
-      }
-    }
-  })();
+  const avg = arr => arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : 0;
+  const min = arr => arr.length ? Math.round(Math.min(...arr)) : 0;
+  const max = arr => arr.length ? Math.round(Math.max(...arr)) : 0;
+  const sum = arr => arr.length ? Math.round(arr.reduce((a, b) => a + b, 0)) : 0;
 
-  setInterval(checkResults, 200);
+  const frameExtractionTimes = allMetrics.map(m => m.frameExtractionMs);
+  const inferenceTimes = allMetrics.map(m => m.totalInferenceMs);
+  const totalTimes = allMetrics.map(m => m.totalMs);
+  const wallClockTimes = allMetrics.map(m => m.wallClockMs);
+  const ocrCount = allMetrics.filter(m => m.ocrDetected).length;
 
-  // Poll for model ready — onChanged can miss the transition
-  const scanInterval = setInterval(() => {
-    if (initialScanDone) {
-      clearInterval(scanInterval);
-      return;
-    }
-    scan();
-  }, 1000);
+  console.log('\n');
+  console.log('='.repeat(70));
+  console.log('  GIF ACCESSIBILITY BENCHMARK RESULTS');
+  console.log('='.repeat(70));
+  console.log('  Model:              SmolVLM-256M (' + (allMetrics[0]?.device || 'unknown') + ')');
+  console.log('  OCR:                Tesseract.js');
+  console.log('  Frames per GIF:     16 (4x4 grid)');
+  console.log('  Total GIFs:         ' + totalGifs);
+  console.log('-'.repeat(70));
+  console.log('  LOADING');
+  console.log('    Model load:       ' + firstModelLoadMs + 'ms');
+  console.log('    OCR load:         ' + firstOcrLoadMs + 'ms');
+  console.log('-'.repeat(70));
+  console.log('  PER-GIF METRICS (ms)          Avg      Min      Max    Total');
+  console.log('    Grid construction:    ' + String(avg(frameExtractionTimes)).padStart(8) + String(min(frameExtractionTimes)).padStart(9) + String(max(frameExtractionTimes)).padStart(9) + String(sum(frameExtractionTimes)).padStart(9));
+  console.log('    Inference:            ' + String(avg(inferenceTimes)).padStart(8) + String(min(inferenceTimes)).padStart(9) + String(max(inferenceTimes)).padStart(9) + String(sum(inferenceTimes)).padStart(9));
+  console.log('    Pipeline (total):     ' + String(avg(totalTimes)).padStart(8) + String(min(totalTimes)).padStart(9) + String(max(totalTimes)).padStart(9) + String(sum(totalTimes)).padStart(9));
+  console.log('    Wall clock:           ' + String(avg(wallClockTimes)).padStart(8) + String(min(wallClockTimes)).padStart(9) + String(max(wallClockTimes)).padStart(9) + String(sum(wallClockTimes)).padStart(9));
+  console.log('-'.repeat(70));
+  console.log('  OCR');
+  console.log('    GIFs with text:   ' + ocrCount + '/' + totalGifs);
+  console.log('-'.repeat(70));
+  console.log('  TOTALS');
+  console.log('    Page load → all accessible: ' + totalTime + 'ms (' + (totalTime / 1000).toFixed(1) + 's)');
+  console.log('    First GIF accessible at:    ' + (allMetrics[0]?.sincePageLoadMs || 'N/A') + 'ms');
+  console.log('    Last GIF accessible at:     ' + (allMetrics[allMetrics.length - 1]?.sincePageLoadMs || 'N/A') + 'ms');
+  console.log('    Avg time per GIF:           ' + avg(wallClockTimes) + 'ms');
+  console.log('='.repeat(70));
 
-  chrome.storage.onChanged.addListener((changes) => {
-    if (changes.modelStatus?.newValue?.status === 'ready' && !initialScanDone) {
-      scan();
-    }
-  });
+  // Per-GIF table
+  console.log('\n  PER-GIF BREAKDOWN:');
+  console.log('  #   Frames  Grid     Inference  OCR     Total   Since Load');
+  for (const m of allMetrics) {
+    console.log(
+      '  ' + String(m.gifIndex).padStart(2) + '  ' +
+      String(m.framesExtracted + '/' + m.totalGifFrames).padStart(7) + '  ' +
+      String(m.frameExtractionMs).padStart(7) + '  ' +
+      String(m.totalInferenceMs).padStart(9) + '  ' +
+      String(m.ocrDetected ? 'yes' : 'no').padStart(3) + '  ' +
+      String(m.totalMs).padStart(7) + '  ' +
+      String(m.sincePageLoadMs).padStart(10)
+    );
+  }
+  console.log('='.repeat(70));
 
-  // Watch for dynamically added images (SPAs load GIFs after content script)
-  let scanDebounce = null;
-  const observer = new MutationObserver((mutations) => {
-    if (initialScanDone) return;
-    // Check if any added nodes contain images
-    let hasNewImages = false;
-    for (const m of mutations) {
-      for (const node of m.addedNodes) {
-        if (node.nodeName === 'IMG' || (node.querySelectorAll && node.querySelectorAll('img').length > 0)) {
-          hasNewImages = true;
-          break;
-        }
-      }
-      if (hasNewImages) break;
-    }
-    if (hasNewImages) {
-      clearTimeout(scanDebounce);
-      scanDebounce = setTimeout(() => {
-        logTiming('MutationObserver: new images detected, scanning...');
-        scan();
-      }, 500);
-    }
-  });
-  observer.observe(document.body, { childList: true, subtree: true });
-
-  scan();
-} else {
-  console.error('[GIF] Extension context invalid!');
+  saveMetrics(totalTime, ocrCount);
 }
+
+function saveMetrics(totalTime, ocrCount) {
+  const avg = arr => arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : 0;
+
+  const report = {
+    timestamp: new Date().toISOString(),
+    pageUrl: window.location.href,
+    config: {
+      model: 'Patricijia/smolvlm-tgif-gif-descriptor',
+      baseModel: 'HuggingFaceTB/SmolVLM-256M-Instruct',
+      device: allMetrics[0]?.device || 'unknown',
+      framesPerGif: 16,
+      gridSize: '4x4',
+      ocr: 'tesseract.js',
+    },
+    summary: {
+      totalGifs,
+      modelLoadMs: firstModelLoadMs,
+      ocrLoadMs: firstOcrLoadMs,
+      pageLoadToAllAccessibleMs: totalTime,
+      firstGifAccessibleMs: allMetrics[0]?.sincePageLoadMs || null,
+      lastGifAccessibleMs: allMetrics[allMetrics.length - 1]?.sincePageLoadMs || null,
+      avgWallClockPerGifMs: avg(allMetrics.map(m => m.wallClockMs)),
+      avgFrameExtractionMs: avg(allMetrics.map(m => m.frameExtractionMs)),
+      avgInferenceMs: avg(allMetrics.map(m => m.totalInferenceMs)),
+      gifsWithOcr: ocrCount,
+    },
+    perGif: allMetrics,
+  };
+
+  chrome.runtime.sendMessage({ type: 'SAVE_METRICS', format: 'json', ocrEnabled: OCR_ENABLED, data: JSON.stringify(report, null, 2) });
+
+  // CSV
+  const csvHeader = [
+    'gif_index', 'url', 'total_gif_frames', 'frames_extracted',
+    'frame_extraction_ms', 'total_inference_ms',
+    'ocr_detected', 'ocr_text',
+    'total_pipeline_ms', 'wall_clock_ms', 'since_page_load_ms',
+    'model_load_ms', 'ocr_load_ms', 'caption'
+  ].join(',');
+
+  const csvRows = allMetrics.map(m => [
+    m.gifIndex,
+    '"' + (m.url || '').replace(/"/g, '""') + '"',
+    m.totalGifFrames,
+    m.framesExtracted,
+    m.frameExtractionMs,
+    m.totalInferenceMs,
+    m.ocrDetected ? 1 : 0,
+    '"' + (m.ocrText || '').replace(/"/g, '""') + '"',
+    m.totalMs,
+    m.wallClockMs,
+    m.sincePageLoadMs,
+    m.gifIndex === 1 ? firstModelLoadMs : 0,
+    m.gifIndex === 1 ? firstOcrLoadMs : 0,
+    '"' + (m.caption || '').replace(/"/g, '""') + '"',
+  ].join(','));
+
+  chrome.runtime.sendMessage({ type: 'SAVE_METRICS', format: 'csv', ocrEnabled: OCR_ENABLED, data: [csvHeader, ...csvRows].join('\n') });
+
+  console.log('[GIF] Benchmark metrics saved to ~/Downloads/gif-benchmarks/');
+
+  // Auto-refresh for next benchmark run (separate counter per OCR setting).
+  const runCount = parseInt(sessionStorage.getItem(RUN_KEY) || '0', 10) + 1;
+  sessionStorage.setItem(RUN_KEY, String(runCount));
+  console.log(`[GIF] Completed run ${runCount}/${BENCHMARK_TOTAL_RUNS} (OCR ${OCR_ENABLED ? 'on' : 'off'})`);
+
+  if (runCount < BENCHMARK_TOTAL_RUNS) {
+    console.log(`[GIF] Refreshing in ${BENCHMARK_DELAY_MS / 1000}s for next run...`);
+    setTimeout(() => location.reload(), BENCHMARK_DELAY_MS);
+  } else {
+    console.log(`[GIF] All benchmark runs complete! Run sessionStorage.removeItem('${RUN_KEY}') to reset.`);
+    sessionStorage.removeItem(RUN_KEY);
+  }
+}
+
+function isGif(img) {
+  const src = img.src.toLowerCase();
+  return src.endsWith('.gif') || src.includes('giphy') || src.includes('tenor');
+}
+
+function scanAndLabelGIFs() {
+  const gifs = Array.from(document.querySelectorAll('img'))
+    .filter(img => isGif(img) && !seen.has(img.src));
+
+  if (gifs.length > 0) {
+    totalGifs += gifs.length;
+    console.log('[GIF] Found ' + gifs.length + ' new GIFs (' + totalGifs + ' total)');
+  }
+
+  gifs.forEach(labelGif);
+}
+
+scanAndLabelGIFs();
+
+const observer = new MutationObserver(scanAndLabelGIFs);
+observer.observe(document.body, { childList: true, subtree: true });

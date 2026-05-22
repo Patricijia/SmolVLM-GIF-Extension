@@ -1,97 +1,69 @@
-// Background service worker - opens inference tab for WebGPU-accelerated SmolVLM
+// Service worker — manages offscreen document and routes messages.
+// Same architecture as vit-gpt2 extension.
 
-console.log('[BG] Background started');
+async function ensureOffscreen() {
+  const contexts = await chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT'],
+  });
+  if (contexts.length > 0) return;
 
-let inferenceTabId = null;
-
-async function findInferenceTab() {
-  const tabs = await chrome.tabs.query({ url: chrome.runtime.getURL('inference.html') });
-  if (tabs.length > 0) {
-    inferenceTabId = tabs[0].id;
-    return true;
-  }
-  return false;
+  await chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['WORKERS'],
+    justification: 'SmolVLM model inference with WebGPU',
+  });
 }
 
-async function ensureInferenceTab() {
-  const inferenceUrl = chrome.runtime.getURL('inference.html');
+// Pre-create offscreen document so model starts loading immediately
+ensureOffscreen();
 
-  // Check if tab still exists and is actually showing inference.html (not a crash/error page)
-  if (inferenceTabId) {
-    try {
-      const tab = await chrome.tabs.get(inferenceTabId);
-      if (tab.url && tab.url.startsWith(inferenceUrl)) {
-        return;
-      }
-      // Tab exists but shows error page — close it and reopen
-      console.log('[BG] Inference tab crashed (' + tab.url + '), reopening...');
-      await chrome.tabs.remove(inferenceTabId).catch(() => {});
-      inferenceTabId = null;
-    } catch (e) {
-      inferenceTabId = null;
+// Separate run counters for OCR-on vs OCR-off so the runs don't interleave.
+let runCounter = 0;
+let runCounterNoOcr = 0;
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Handle benchmark file saving
+  if (message.type === 'SAVE_METRICS') {
+    const ocrOff = message.ocrEnabled === false;
+    if (message.format === 'json') {
+      if (ocrOff) runCounterNoOcr++; else runCounter++;
     }
-  }
+    const id = ocrOff ? runCounterNoOcr : runCounter;
+    const suffix = ocrOff ? '-no-ocr' : '';
+    const mimeType = message.format === 'json' ? 'application/json' : 'text/csv';
+    const dataUrl = 'data:' + mimeType + ';base64,' + btoa(unescape(encodeURIComponent(message.data)));
+    const filename = 'smolvlm-base-benchmark' + suffix + '-run' + id + '.' + message.format;
 
-  // Check if already open
-  if (await findInferenceTab()) {
-    console.log('[BG] Inference tab found');
-    return;
-  }
-
-  // Open new tab
-  console.log('[BG] Opening inference tab...');
-  const tab = await chrome.tabs.create({
-    url: chrome.runtime.getURL('inference.html'),
-    active: false,  // Open in background
-    pinned: true,
-  });
-  inferenceTabId = tab.id;
-  console.log('[BG] Inference tab opened (id=' + tab.id + ')');
-}
-
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  console.log('[BG] Message:', msg.type);
-
-  if (msg.type === 'loadModel') {
-    ensureInferenceTab().then(() => {
-      // The inference page auto-loads the model on open
-      sendResponse({ success: true });
+    chrome.downloads.download({
+      url: dataUrl,
+      filename: 'gif-benchmarks/' + filename,
+      conflictAction: 'overwrite',
+      saveAs: false,
+    }, () => {
+      sendResponse({ ok: true, runId: id });
     });
+
     return true;
   }
 
-  if (msg.type === 'keepAlive') {
-    sendResponse({ alive: true });
-    return true;
-  }
-});
+  // Route DESCRIBE_GIF from content script → offscreen document
+  if (message.type !== 'DESCRIBE_GIF') return;
+  if (message.target === 'offscreen') return;
 
-function resetStorage() {
-  chrome.storage.local.set({
-    modelStatus: { status: 'idle', progress: 0, captionCount: 0 },
-    captionQueue: [],
-    captionResults: {}
-  });
-}
+  console.log('[background] Forwarding DESCRIBE_GIF to offscreen');
 
-async function closeAllInferenceTabs() {
-  const tabs = await chrome.tabs.query({ url: chrome.runtime.getURL('inference.html') });
-  for (const tab of tabs) {
-    await chrome.tabs.remove(tab.id).catch(() => {});
-  }
-  inferenceTabId = null;
-}
+  ensureOffscreen()
+    .then(() =>
+      chrome.runtime.sendMessage({ ...message, target: 'offscreen' })
+    )
+    .then((response) => {
+      console.log('[background] Got response from offscreen:', response);
+      sendResponse(response);
+    })
+    .catch((err) => {
+      console.error('[background] Error:', err);
+      sendResponse({ error: err.message });
+    });
 
-chrome.runtime.onInstalled.addListener(async () => {
-  console.log('[BG] Installed — clearing storage & opening inference tab');
-  await closeAllInferenceTabs();
-  resetStorage();
-  ensureInferenceTab();
-});
-
-chrome.runtime.onStartup.addListener(async () => {
-  console.log('[BG] Browser started — clearing stale queue & opening inference tab');
-  await closeAllInferenceTabs();
-  resetStorage();
-  ensureInferenceTab();
+  return true;
 });

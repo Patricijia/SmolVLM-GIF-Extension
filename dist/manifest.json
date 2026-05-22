@@ -3,7 +3,7 @@
     "name": "GIF Accessibility Reader - SmolVLM",
     "version": "1.0.0",
     "description": "AI-generated alt text for GIFs using SmolVLM in your browser",
-    "permissions": ["storage", "unlimitedStorage", "tabs"],
+    "permissions": ["storage", "unlimitedStorage", "offscreen", "downloads"],
     "host_permissions": ["<all_urls>"],
     "background": {
       "service_worker": "background.js"
@@ -13,10 +13,6 @@
       "js": ["content.js"],
       "run_at": "document_idle"
     }],
-    "action": {
-      "default_popup": "popup.html",
-      "default_icon": { "48": "icons/icon48.png" }
-    },
     "icons": { "48": "icons/icon48.png", "128": "icons/icon128.png" },
     "content_security_policy": {
       "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';"

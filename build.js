@@ -41,22 +41,11 @@ if (existsSync(tessWorkerPath)) {
   console.log('Copied tesseract: worker.min.js');
 }
 
-// Bundle inference.js (extension tab page for WebGPU inference)
+// Bundle offscreen.js (offscreen document for WebGPU inference)
 await esbuild.build({
-  entryPoints: ['src/inference.js'],
+  entryPoints: ['src/offscreen.js'],
   bundle: true,
-  outfile: 'dist/inference.js',
-  format: 'esm',
-  platform: 'browser',
-  target: 'chrome120',
-  minify: false,
-});
-
-// Bundle vlm-worker.js (Web Worker for SmolVLM inference)
-await esbuild.build({
-  entryPoints: ['src/vlm-worker.js'],
-  bundle: true,
-  outfile: 'dist/vlm-worker.js',
+  outfile: 'dist/offscreen.bundle.js',
   format: 'esm',
   platform: 'browser',
   target: 'chrome120',

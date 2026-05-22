@@ -11,7 +11,7 @@ env.backends.onnx.wasm.numThreads = navigator.hardwareConcurrency || 4;
 env.allowLocalModels = false;
 env.useBrowserCache = true;
 
-const DEFAULT_MODEL_ID = 'Patricijia/smolvlm-gif-descriptor';
+const DEFAULT_MODEL_ID = 'Patricijia/smolvlm-tgif-gif-descriptor';
 let MODEL_ID = DEFAULT_MODEL_ID;
 let PROCESSOR_ID = DEFAULT_MODEL_ID;
 
@@ -207,14 +207,13 @@ const forceWasm = new URL(location.href).searchParams.has('wasm');
 async function loadModel() {
   if (isLoaded) return;
 
-  // Pick up any model preference set by the content script
-  const storedModel = await getStorage('selectedModelId');
-  if (storedModel.selectedModelId) {
-    MODEL_ID = storedModel.selectedModelId;
-    PROCESSOR_ID = storedModel.selectedModelId;
-  }
+  // Always use the fine-tuned model
+  MODEL_ID = 'Patricijia/smolvlm-tgif-gif-descriptor';
+  PROCESSOR_ID = 'Patricijia/smolvlm-tgif-gif-descriptor';
+  const REVISION = 'dea89760546fd9cac410e5a2cd73f255ebda8a5b';
 
   log('[INF] Loading models...');
+  log('[INF] MODEL_ID: ' + MODEL_ID);
   log('[INF] URL: ' + location.href);
   log('[INF] forceWasm=' + forceWasm + ' navigator.gpu=' + (typeof navigator.gpu) + ' value=' + navigator.gpu);
   setStatus('Loading SmolVLM...', 'loading');
@@ -300,15 +299,22 @@ async function loadModel() {
     } catch (e) {
       log('[INF] Step 2 FAILED: ' + e.message + '\n' + (e.stack || ''));
       if (useDevice === 'webgpu') {
-        log('[INF] WebGPU model load failed — retrying with WASM q8 (no page reload)...');
-        useDevice = 'wasm'; useDtype = 'q8';
+        // Try WebGPU with fp32 first (our ONNX export works with fp32)
+        log('[INF] WebGPU fp16 failed — trying WebGPU fp32...');
         try {
-          log('[INF] Step 2 retry: WASM q8...');
-          model = await AutoModelForVision2Seq.from_pretrained(MODEL_ID, { dtype: 'q8', device: 'wasm' });
-          log('[INF] Step 2 retry done');
+          model = await AutoModelForVision2Seq.from_pretrained(MODEL_ID, { dtype: 'fp32', device: 'webgpu' });
+          useDevice = 'webgpu'; useDtype = 'fp32';
+          log('[INF] Step 2 retry (WebGPU fp32) done');
         } catch (e2) {
-          log('[INF] Step 2 retry FAILED: ' + e2.message);
-          throw e2;
+          log('[INF] WebGPU fp32 also failed: ' + e2.message + ' — falling back to WASM...');
+          useDevice = 'wasm'; useDtype = 'q8';
+          try {
+            model = await AutoModelForVision2Seq.from_pretrained(MODEL_ID, { dtype: 'q8', device: 'wasm' });
+            log('[INF] Step 2 retry (WASM q8) done');
+          } catch (e3) {
+            log('[INF] Step 2 retry FAILED: ' + e3.message);
+            throw e3;
+          }
         }
       } else {
         throw e;
@@ -326,6 +332,24 @@ async function loadModel() {
 
     device = useDevice;
     log('[INF] ✅ SmolVLM loaded (' + device + ' ' + useDtype + ')');
+
+    // Debug: inspect model sessions
+    if (model && model.sessions) {
+      const sessionNames = Object.keys(model.sessions);
+      log('[INF] DEBUG: Model sessions: ' + sessionNames.join(', '));
+      for (const name of sessionNames) {
+        const sess = model.sessions[name];
+        if (sess && sess.inputNames) {
+          log('[INF] DEBUG: ' + name + ' inputs: ' + sess.inputNames.slice(0, 5).join(', ') + (sess.inputNames.length > 5 ? '...' : ''));
+          log('[INF] DEBUG: ' + name + ' outputs: ' + sess.outputNames.slice(0, 5).join(', ') + (sess.outputNames.length > 5 ? '...' : ''));
+        }
+      }
+    }
+    // Debug: check if model has config
+    if (model && model.config) {
+      log('[INF] DEBUG: model.config.model_type=' + model.config.model_type);
+      log('[INF] DEBUG: model.config._name_or_path=' + model.config._name_or_path);
+    }
 
     isLoaded = true;
     const loadTime = Math.round(performance.now() - start);
@@ -395,6 +419,17 @@ async function generateCaptionBatch(imageDataArray) {
   log('[INF] pixel_values shape=' + JSON.stringify(pvShape) + '  input_ids shape=' + JSON.stringify(idsShape));
 
   log('[INF] Running generate (' + imageDataArray.length + ' items)...');
+  log('[INF] DEBUG: generate params: do_sample=false, max_new_tokens=20, repetition_penalty=1.3');
+
+  // Log first few input_ids tokens
+  if (inputs.input_ids) {
+    const ids = inputs.input_ids;
+    const firstTokens = [];
+    for (let i = 0; i < Math.min(10, ids.dims[1]); i++) firstTokens.push(ids.data[i]);
+    log('[INF] DEBUG: first input_ids: [' + firstTokens.join(', ') + '...]');
+    log('[INF] DEBUG: input_ids total length: ' + ids.dims[1]);
+  }
+
   const genStart = performance.now();
   const output = await model.generate({
     ...inputs,
@@ -405,10 +440,26 @@ async function generateCaptionBatch(imageDataArray) {
   const genTime = Math.round(performance.now() - genStart);
   log('[INF] generate=' + genTime + 'ms  total=' + Math.round(performance.now()-t0) + 'ms');
 
-  return processor.batch_decode(output, { skip_special_tokens: true }).map(fullText => {
+  // Log raw output tokens
+  if (output) {
+    const outTokens = [];
+    const data = output.data || output[0]?.data;
+    if (data) {
+      for (let i = Math.max(0, data.length - 25); i < data.length; i++) outTokens.push(data[i]);
+      log('[INF] DEBUG: last 25 output tokens: [' + outTokens.join(', ') + ']');
+    }
+    log('[INF] DEBUG: output dims: ' + JSON.stringify(output.dims || 'N/A'));
+  }
+
+  const decoded = processor.batch_decode(output, { skip_special_tokens: true });
+  log('[INF] DEBUG: raw decoded: "' + (decoded[0] || '').slice(0, 200) + '"');
+
+  return decoded.map(fullText => {
     const idx = fullText.lastIndexOf('Assistant:');
-    return (idx >= 0 ? fullText.slice(idx + 10) : fullText)
+    const caption = (idx >= 0 ? fullText.slice(idx + 10) : fullText)
       .trim().replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ');
+    log('[INF] DEBUG: final caption: "' + caption.slice(0, 100) + '"');
+    return caption;
   });
 }
 
@@ -432,9 +483,8 @@ async function processQueue() {
 
         if (queue.length > 0) {
           logCounter = 0;
-          // WebGPU JSEP doesn't support concurrent ONNX sessions — batch=1 only.
-        // WASM can safely batch.
-        const batchSize = Math.min(device === 'webgpu' ? 1 : BATCH_SIZE, queue.length);
+          // Use batch=1 for both WebGPU and WASM to avoid session conflicts
+        const batchSize = 1;
           const batch = queue.splice(0, batchSize);
           await setStorage({ captionQueue: queue });
 
@@ -512,18 +562,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ alive: true, device, captionCount, isLoaded });
   }
   return true;
-});
-
-// Reload the inference page when the user switches models from the test bench.
-// Reloading the page is the only reliable way to fully dispose WebGPU/ONNX sessions.
-chrome.storage.onChanged.addListener((changes) => {
-  if (changes.selectedModelId) {
-    const newId = changes.selectedModelId.newValue;
-    if (newId && newId !== MODEL_ID) {
-      log('[INF] Model switch detected: ' + newId + ' — reloading page...');
-      location.reload();
-    }
-  }
 });
 
 loadModel();

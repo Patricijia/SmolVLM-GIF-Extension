@@ -10,7 +10,7 @@ env.backends.onnx.wasm.wasmPaths = self.location.href.replace(/vlm-worker\.js$/,
 env.allowLocalModels = false;
 env.useBrowserCache = true;
 
-const MODEL_ID = 'HuggingFaceTB/SmolVLM-256M-Instruct';
+const MODEL_ID = 'Patricijia/smolvlm-tgif-gif-descriptor';
 
 let processor = null;
 let model = null;
