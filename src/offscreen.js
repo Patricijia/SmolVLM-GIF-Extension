@@ -38,29 +38,26 @@ async function loadModel() {
 
     processor = await AutoProcessor.from_pretrained(MODEL_ID);
 
-    // Try WebGPU fp16, fallback to fp32, then WASM
+    // fp32 on WebGPU (default adapter = discrete NVIDIA), fallback to WASM fp32.
+    // We deliberately do NOT use fp16: the only shader-f16 adapter here is the
+    // weak Intel iGPU, which makes fp16 ~3x slower and confounds precision with
+    // device. fp32 on the NVIDIA matches the fine-tuned SmolVLM runs (fair base-
+    // vs-fine-tuned latency comparison).
     try {
-      const adapter = await navigator.gpu?.requestAdapter({ powerPreference: 'low-power' });
-      if (adapter?.features?.has('shader-f16')) {
+      const adapter = await navigator.gpu?.requestAdapter();
+      if (adapter) {
         navigator.gpu.requestAdapter = async () => adapter;
-        model = await AutoModelForVision2Seq.from_pretrained(MODEL_ID, { dtype: 'fp16', device: 'webgpu' });
-        device = 'webgpu-fp16';
-        console.log('[offscreen] SmolVLM loaded (WebGPU fp16)');
-      } else {
-        throw new Error('No fp16 support');
-      }
-    } catch (e) {
-      console.log('[offscreen] WebGPU fp16 failed:', e.message, '- trying fp32...');
-      try {
         model = await AutoModelForVision2Seq.from_pretrained(MODEL_ID, { dtype: 'fp32', device: 'webgpu' });
         device = 'webgpu-fp32';
         console.log('[offscreen] SmolVLM loaded (WebGPU fp32)');
-      } catch (e2) {
-        console.log('[offscreen] WebGPU fp32 failed:', e2.message, '- falling back to WASM q8...');
-        model = await AutoModelForVision2Seq.from_pretrained(MODEL_ID, { dtype: 'q8', device: 'wasm' });
-        device = 'wasm-q8';
-        console.log('[offscreen] SmolVLM loaded (WASM q8)');
+      } else {
+        throw new Error('No WebGPU');
       }
+    } catch (e) {
+      console.log('[offscreen] WebGPU failed:', e.message, '- falling back to WASM fp32...');
+      model = await AutoModelForVision2Seq.from_pretrained(MODEL_ID, { dtype: 'fp32', device: 'wasm' });
+      device = 'wasm-fp32';
+      console.log('[offscreen] SmolVLM loaded (WASM fp32)');
     }
 
     modelLoadTime = performance.now() - t0;
@@ -325,8 +322,8 @@ async function describeGif(url, ocrEnabled = true) {
   const [{ caption: rawCaption, genTime }, ocrText] = await Promise.all([captionPromise, ocrPromise]);
   const tDone = performance.now();
 
-  let caption = rawCaption;
-  if (ocrText && ocrText.length > 3) caption += '. Text: ' + ocrText;
+  let caption = 'GIF displays ' + rawCaption.trim().replace(/\.\s+/g, ' and ').replace(/\.$/, '');
+  if (ocrText && ocrText.length > 3) caption += ' with text ' + ocrText;
 
   const metrics = {
     modelLoadMs: Math.round(modelLoadTime),

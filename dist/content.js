@@ -12,6 +12,35 @@
   var MAX_RETRIES = 10;
   var labelsApplied = 0;
   var totalGifs = 0;
+  var srLiveRegion = null;
+  function initLiveRegion() {
+    if (srLiveRegion || !document.body) return;
+    srLiveRegion = document.createElement("div");
+    srLiveRegion.id = "gif-a11y-status";
+    srLiveRegion.setAttribute("aria-live", "polite");
+    srLiveRegion.setAttribute("aria-atomic", "true");
+    srLiveRegion.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;border:0;";
+    document.body.appendChild(srLiveRegion);
+  }
+  function announceCaptionProgress() {
+    initLiveRegion();
+    if (!srLiveRegion) return;
+    const plural = totalGifs === 1 ? "GIF" : "GIFs";
+    let msg;
+    if (totalGifs === 0) {
+      return;
+    } else if (labelsApplied === 0) {
+      msg = "Captioning " + totalGifs + " " + plural + " on this page. This may take a moment, please wait.";
+    } else if (labelsApplied >= totalGifs) {
+      msg = "All " + totalGifs + " " + plural + " on this page captioned.";
+    } else {
+      msg = labelsApplied + " of " + totalGifs + " " + plural + " captioned.";
+    }
+    srLiveRegion.textContent = "";
+    setTimeout(() => {
+      if (srLiveRegion) srLiveRegion.textContent = msg;
+    }, 60);
+  }
   var allMetrics = [];
   function publishMetrics() {
     try {
@@ -40,11 +69,13 @@
       gif.setAttribute("role", "img");
       gif.setAttribute("tabindex", "0");
       const tag = document.createElement("span");
+      tag.setAttribute("aria-hidden", "true");
       tag.innerText = label;
       tag.style.cssText = "background: #00c9a7; color: black; font-size: 12px; padding: 2px 4px; position: absolute; z-index: 9999; border-radius: 4px; left: " + (gif.getBoundingClientRect().right + window.scrollX + 5) + "px; top: " + (gif.getBoundingClientRect().top + window.scrollY) + "px; max-width: 300px; display: inline-block;";
       document.body.appendChild(tag);
       retryCount.delete(url);
       labelsApplied++;
+      announceCaptionProgress();
       if (metrics) {
         if (firstModelLoadMs === null) firstModelLoadMs = metrics.modelLoadMs;
         if (firstOcrLoadMs === null) firstOcrLoadMs = metrics.ocrLoadMs;
@@ -134,8 +165,9 @@
       timestamp: (/* @__PURE__ */ new Date()).toISOString(),
       pageUrl: window.location.href,
       config: {
-        model: "Patricijia/smolvlm-tgif-gif-descriptor",
+        model: "HuggingFaceTB/SmolVLM-256M-Instruct",
         baseModel: "HuggingFaceTB/SmolVLM-256M-Instruct",
+        fineTuned: false,
         device: allMetrics[0]?.device || "unknown",
         framesPerGif: 16,
         gridSize: "4x4",
@@ -209,10 +241,12 @@
     const gifs = Array.from(document.querySelectorAll("img")).filter((img) => isGif(img) && !seen.has(img.src));
     if (gifs.length > 0) {
       totalGifs += gifs.length;
+      announceCaptionProgress();
       console.log("[GIF] Found " + gifs.length + " new GIFs (" + totalGifs + " total)");
     }
     gifs.forEach(labelGif);
   }
+  initLiveRegion();
   scanAndLabelGIFs();
   var observer = new MutationObserver(scanAndLabelGIFs);
   observer.observe(document.body, { childList: true, subtree: true });

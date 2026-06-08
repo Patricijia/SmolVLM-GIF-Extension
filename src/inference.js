@@ -510,8 +510,8 @@ async function processQueue() {
             for (let i = 0; i < batch.length; i++) {
               const item = batch[i];
               ocrCache.delete(item.gifId);
-              let finalCaption = captions[i];
-              if (ocrTexts[i] && ocrTexts[i].length > 3) finalCaption += '. Text: ' + ocrTexts[i];
+              let finalCaption = 'GIF displays ' + captions[i].trim().replace(/\.\s+/g, ' and ').replace(/\.$/, '');
+              if (ocrTexts[i] && ocrTexts[i].length > 3) finalCaption += ' with text ' + ocrTexts[i];
               finalCaption = finalCaption.replace(/\s+/g, ' ').trim();
               results[item.gifId] = { caption: finalCaption, ocrText: ocrTexts[i], time: 0 };
               captionCount++;
